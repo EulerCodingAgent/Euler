@@ -1,0 +1,15 @@
+.venv 
+__pycache__
+venv
+*.egg-info
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+*.pyzw
+*.pyzwz
+*.pyzwzw
+
+Euler_Agent.egg-info

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Euler-Agent"
+version = "0.1.0"
+description = "Euler coding agent CLI with multi-provider and multi-agent orchestration."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Euler Agent Contributors" }
+]
+dependencies = [
+  "typer>=0.12.3",
+  "rich>=13.7.1",
+  "pydantic>=2.7.1",
+  "langchain>=0.2.6",
+  "langgraph>=0.1.5",
+  "langchain-openai>=0.1.8",
+  "langchain-anthropic>=0.1.15",
+  "langchain-google-genai>=1.0.6",
+]
+
+[project.scripts]
+Euler = "euler_agent.cli:app"
+euler = "euler_agent.cli:app"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["euler_agent*"]

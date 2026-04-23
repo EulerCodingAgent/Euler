@@ -1,0 +1,37 @@
+"""Local user config management."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+Provider = Literal["openai", "anthropic", "gemini"]
+
+
+class AgentConfig(BaseModel):
+    provider: Provider = "openai"
+    model: str = "gpt-4o-mini"
+    api_key: str = Field(default="", repr=False)
+
+
+CONFIG_DIR = Path.home() / ".euler_agent"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_config() -> AgentConfig:
+    if not CONFIG_FILE.exists():
+        return AgentConfig()
+
+    raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    return AgentConfig.model_validate(raw)
+
+
+def save_config(config: AgentConfig) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(
+        json.dumps(config.model_dump(), indent=2),
+        encoding="utf-8",
+    )

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Euler-Agent"
-version = "0.1.0"
+version = "0.4.0"
 description = "Euler coding agent CLI with multi-provider and multi-agent orchestration."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ dependencies = [
   "langchain-openai>=0.1.8",
   "langchain-anthropic>=0.1.15",
   "langchain-google-genai>=1.0.6",
+  "fastembed>=0.3.6",
 ]
 
 [project.scripts]

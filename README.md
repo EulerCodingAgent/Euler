@@ -28,6 +28,20 @@ You can also run one-shot tasks:
 Euler run "Build a FastAPI todo service with tests"
 ```
 
+Autonomous build/fix loop:
+
+```bash
+Euler autopilot "Fix failing tests and refactor auth module" --verify-command "pytest -q"
+```
+
+Build semantic index and search code:
+
+```bash
+Euler index
+Euler search-code "where is auth token validation implemented"
+Euler graph
+```
+
 ## Features in this version
 
 - Provider/model selection: OpenAI, Anthropic, Gemini
@@ -36,8 +50,15 @@ Euler run "Build a FastAPI todo service with tests"
   - free-form coding prompts
   - SQL generation via `/sql`
   - selected code replacement via `/replace <file> <start> <end> <instruction>`
-- Multi-agent orchestration scaffold (planner -> parallel workers -> reviewer) powered by LangGraph
+- Autonomous execution loop with retries and command observations
+- Guardrailed autopilot with command allowlist, workdir sandbox, and mutation limits
+- Multi-agent orchestration with specialist roles (planner -> architect/coder/tester in parallel -> arbitrator -> reviewer)
 - Support for project instruction memory in `./Euler/*.md`
+- Persistent long-term memory for previous project goals/results (`Euler memory "<query>"`)
+- Embedding-backed semantic memory retrieval (local vector search via FastEmbed)
+- AST-aware patch safety guards for Python edits in autonomous mode
+- Repo semantic indexing for codebase-wide natural language retrieval (`Euler index`, `Euler search-code`)
+- Python code graph extraction for modules/imports/functions/classes (`Euler graph`)
 - Avatar/banner shown when CLI activates
 
 ## Project instruction memory
@@ -50,12 +71,11 @@ Euler init
 
 This creates `Euler/project.md` in your current repo. Add architecture notes, coding rules, or domain constraints there. Euler injects those docs into agent context automatically.
 
-## Roadmap toward full Claude-Code parity
+## Remaining roadmap toward full Claude-Code parity
 
 The current release is a foundation and architecture scaffold. To reach full parity, next milestones are:
 
-- deeper file-aware tool calling and patch planning
-- autonomous command execution loops with retries
-- stronger long-term memory + embeddings
-- richer specialized agents (architect/coder/tester/reviewer with conflict handling)
-- advanced code intelligence (repo graph, semantic indexing, refactor primitives)
+- advanced cross-language graphing (Python + TS/JS + SQL symbol relations)
+- stronger patch rollback snapshots and transactional edit commits
+- richer tool/plugin protocol compatibility with external MCP-style tools
+- higher autonomy for full app build/deploy loops with explicit approvals

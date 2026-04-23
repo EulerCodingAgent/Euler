@@ -9,8 +9,12 @@ import typer
 from rich.console import Console
 
 from euler_agent.agent import EulerAgent
+from euler_agent.autopilot import run_autopilot
 from euler_agent.avatar import print_activation_banner
+from euler_agent.code_graph import build_code_graph
 from euler_agent.config import AgentConfig, Provider, load_config, save_config
+from euler_agent.memory import search_memory
+from euler_agent.semantic_index import index_path, search_index
 from euler_agent.repl import run_repl
 
 app = typer.Typer(help="Euler coding agent CLI")
@@ -73,6 +77,54 @@ def run_once(
     console.print(output)
 
 
+@app.command("autopilot")
+def autopilot(
+    goal: str = typer.Argument(..., help="Autonomous coding goal"),
+    workdir: Optional[Path] = typer.Option(None, help="Project directory"),
+    max_rounds: int = typer.Option(4, min=1, max=12, help="Max execution rounds"),
+    verify_command: Optional[str] = typer.Option(
+        None,
+        help="Optional validation command executed each round (e.g. pytest -q)",
+    ),
+    max_file_mutations: int = typer.Option(
+        25,
+        min=1,
+        max=500,
+        help="Maximum file mutation actions allowed in this run",
+    ),
+) -> None:
+    cfg = load_config()
+    print_activation_banner(cfg.provider, cfg.model)
+    agent = _build_agent(cfg)
+    wd = str((workdir or Path.cwd()).resolve())
+    output = run_autopilot(
+        agent=agent,
+        goal=goal,
+        workdir=wd,
+        max_rounds=max_rounds,
+        verify_command=verify_command,
+        max_file_mutations=max_file_mutations,
+    )
+    console.print(output)
+
+
+@app.command("memory")
+def memory(
+    query: str = typer.Argument(..., help="Search phrase for prior project runs"),
+    workdir: Optional[Path] = typer.Option(None, help="Project directory"),
+    limit: int = typer.Option(3, min=1, max=20, help="Max memories to show"),
+) -> None:
+    wd = str((workdir or Path.cwd()).resolve())
+    rows = search_memory(project=wd, query=query, limit=limit)
+    if not rows:
+        console.print("[yellow]No matching memory found.[/yellow]")
+        return
+    for row in rows:
+        console.print(f"[bold]{row.timestamp}[/bold] {row.goal}")
+        console.print(row.result[:500])
+        console.print("-" * 40)
+
+
 @app.command("init")
 def init_workspace(path: Optional[Path] = typer.Option(None, help="Target project root")) -> None:
     """
@@ -90,6 +142,44 @@ def init_workspace(path: Optional[Path] = typer.Option(None, help="Target projec
             encoding="utf-8",
         )
     console.print(f"[green]Initialized instructions at {instruction_dir}[/green]")
+
+
+@app.command("index")
+def build_index(
+    workdir: Optional[Path] = typer.Option(None, help="Project directory"),
+) -> None:
+    wd = str((workdir or Path.cwd()).resolve())
+    message = index_path(wd)
+    console.print(f"[green]{message}[/green]")
+
+
+@app.command("search-code")
+def semantic_search(
+    query: str = typer.Argument(..., help="Natural-language code search query"),
+    workdir: Optional[Path] = typer.Option(None, help="Project directory"),
+    limit: int = typer.Option(5, min=1, max=20, help="Result count"),
+) -> None:
+    wd = str((workdir or Path.cwd()).resolve())
+    hits = search_index(wd, query, limit=limit)
+    if not hits:
+        console.print("[yellow]No semantic hits found. Run `Euler index` first.[/yellow]")
+        return
+    for hit in hits:
+        console.print(
+            f"[bold]{hit['path']}[/bold] "
+            f"[dim]lines {hit['start_line']}-{hit['end_line']}[/dim]"
+        )
+        console.print(hit["content"][:450])
+        console.print("-" * 40)
+
+
+@app.command("graph")
+def graph(
+    workdir: Optional[Path] = typer.Option(None, help="Project directory"),
+) -> None:
+    wd = str((workdir or Path.cwd()).resolve())
+    message = build_code_graph(wd)
+    console.print(f"[green]{message}[/green]")
 
 
 if __name__ == "__main__":

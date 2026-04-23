@@ -32,12 +32,15 @@ Autonomous build/fix loop:
 
 ```bash
 Euler autopilot "Fix failing tests and refactor auth module" --verify-command "pytest -q"
+Euler autopilot "Refactor auth module" --policy-profile safe
+Euler autopilot "Implement feature X" --policy-profile aggressive --auto-approve-risky
 ```
 
 Build semantic index and search code:
 
 ```bash
 Euler index
+Euler index --full
 Euler search-code "where is auth token validation implemented"
 Euler graph
 ```
@@ -58,7 +61,12 @@ Euler graph
 - Embedding-backed semantic memory retrieval (local vector search via FastEmbed)
 - AST-aware patch safety guards for Python edits in autonomous mode
 - Repo semantic indexing for codebase-wide natural language retrieval (`Euler index`, `Euler search-code`)
-- Python code graph extraction for modules/imports/functions/classes (`Euler graph`)
+- Incremental semantic index updates with optional full rebuild (`Euler index`, `Euler index --full`)
+- Cross-language graph extraction for Python + TS/JS + SQL symbols/relations (`Euler graph`)
+- Transactional round snapshots with rollback on command/verification failure in autopilot
+- Policy profiles (`safe`, `normal`, `aggressive`) for autopilot guardrails
+- Approval-gated risky commands/actions with explicit auto-approve flag
+- Structured audit logs for each autopilot run in `.euler/audit/*.jsonl`
 - Avatar/banner shown when CLI activates
 
 ## Project instruction memory
@@ -75,7 +83,6 @@ This creates `Euler/project.md` in your current repo. Add architecture notes, co
 
 The current release is a foundation and architecture scaffold. To reach full parity, next milestones are:
 
-- advanced cross-language graphing (Python + TS/JS + SQL symbol relations)
-- stronger patch rollback snapshots and transactional edit commits
 - richer tool/plugin protocol compatibility with external MCP-style tools
 - higher autonomy for full app build/deploy loops with explicit approvals
+- remote team audit sinks and signed execution logs

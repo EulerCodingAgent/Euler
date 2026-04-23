@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from math import sqrt
 from pathlib import Path
@@ -97,14 +98,43 @@ def _chunk_file(path: Path, chunk_lines: int = 80, overlap: int = 20) -> list[tu
     return chunks
 
 
-def index_path(workdir: str, output_path: str | None = None) -> str:
+def _hash_file(path: Path) -> str:
+    data = path.read_bytes()
+    return hashlib.sha256(data).hexdigest()
+
+
+def index_path(workdir: str, output_path: str | None = None, incremental: bool = True) -> str:
     root = Path(workdir).resolve()
     index_file = Path(output_path).resolve() if output_path else root / ".euler" / "semantic_index.json"
     index_file.parent.mkdir(parents=True, exist_ok=True)
 
+    old_payload: dict = {}
+    if incremental and index_file.exists():
+        old_payload = json.loads(index_file.read_text(encoding="utf-8"))
+
+    prior_chunks_by_file: dict[str, list[dict]] = {}
+    prior_manifest: dict[str, dict] = {}
+    for chunk in old_payload.get("chunks", []):
+        prior_chunks_by_file.setdefault(chunk.get("path", ""), []).append(chunk)
+    prior_manifest = old_payload.get("manifest", {})
+
     rows: list[dict] = []
+    manifest: dict[str, dict] = {}
+    reused_files = 0
+    rebuilt_files = 0
     for file_path in _iter_repo_files(root):
         rel = str(file_path.relative_to(root))
+        file_hash = _hash_file(file_path)
+        mtime_ns = file_path.stat().st_mtime_ns
+        manifest[rel] = {"hash": file_hash, "mtime_ns": mtime_ns}
+
+        prior = prior_manifest.get(rel)
+        if incremental and prior and prior.get("hash") == file_hash:
+            rows.extend(prior_chunks_by_file.get(rel, []))
+            reused_files += 1
+            continue
+
+        rebuilt_files += 1
         for start_line, end_line, content in _chunk_file(file_path):
             rows.append(
                 CodeChunk(
@@ -116,9 +146,13 @@ def index_path(workdir: str, output_path: str | None = None) -> str:
                 ).__dict__
             )
 
-    payload = {"root": str(root), "chunks": rows}
+    payload = {"root": str(root), "manifest": manifest, "chunks": rows}
     index_file.write_text(json.dumps(payload), encoding="utf-8")
-    return f"Indexed {len(rows)} chunks into {index_file}"
+    mode = "incremental" if incremental else "full"
+    return (
+        f"Indexed {len(rows)} chunks into {index_file} ({mode}; "
+        f"reused_files={reused_files}, rebuilt_files={rebuilt_files})"
+    )
 
 
 def search_index(workdir: str, query: str, limit: int = 5) -> list[dict]:

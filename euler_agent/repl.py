@@ -32,7 +32,7 @@ def run_repl(agent: EulerAgent) -> None:
                 "/replace <file> <start_line> <end_line> <instruction>\n"
                 "/auto <goal> [verify_command]\n"
                 "/memory <query>\n"
-                "/index\n"
+                "/index [full]\n"
                 "/search <query>\n"
                 "/graph\n"
                 "or write a normal prompt for full-task execution."
@@ -93,8 +93,9 @@ def run_repl(agent: EulerAgent) -> None:
                 console.print("-" * 40)
             continue
 
-        if user_input == "/index":
-            console.print(index_path(str(Path.cwd())))
+        if user_input.startswith("/index"):
+            full = user_input.strip().lower() == "/index full"
+            console.print(index_path(str(Path.cwd()), incremental=not full))
             continue
 
         if user_input.startswith("/search "):

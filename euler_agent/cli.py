@@ -82,6 +82,20 @@ def autopilot(
     goal: str = typer.Argument(..., help="Autonomous coding goal"),
     workdir: Optional[Path] = typer.Option(None, help="Project directory"),
     max_rounds: int = typer.Option(4, min=1, max=12, help="Max execution rounds"),
+    policy_profile: str = typer.Option(
+        "normal",
+        help="Guardrail profile: safe | normal | aggressive",
+    ),
+    require_approval_for_risky: bool = typer.Option(
+        True,
+        "--require-approval-for-risky/--no-require-approval-for-risky",
+        help="Require approval gate for risky commands/actions",
+    ),
+    auto_approve_risky: bool = typer.Option(
+        False,
+        "--auto-approve-risky",
+        help="Auto approve risky operations (use carefully)",
+    ),
     verify_command: Optional[str] = typer.Option(
         None,
         help="Optional validation command executed each round (e.g. pytest -q)",
@@ -102,6 +116,9 @@ def autopilot(
         goal=goal,
         workdir=wd,
         max_rounds=max_rounds,
+        policy_profile=policy_profile,
+        require_approval_for_risky=require_approval_for_risky,
+        auto_approve_risky=auto_approve_risky,
         verify_command=verify_command,
         max_file_mutations=max_file_mutations,
     )
@@ -147,9 +164,14 @@ def init_workspace(path: Optional[Path] = typer.Option(None, help="Target projec
 @app.command("index")
 def build_index(
     workdir: Optional[Path] = typer.Option(None, help="Project directory"),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="Force full reindex (default is incremental)",
+    ),
 ) -> None:
     wd = str((workdir or Path.cwd()).resolve())
-    message = index_path(wd)
+    message = index_path(wd, incremental=not full)
     console.print(f"[green]{message}[/green]")
 
 

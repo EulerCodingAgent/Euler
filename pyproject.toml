@@ -21,7 +21,6 @@ dependencies = [
   "langchain-openai>=0.1.8",
   "langchain-anthropic>=0.1.15",
   "langchain-google-genai>=1.0.6",
-  "fastembed>=0.3.6",
 ]
 
 [project.scripts]

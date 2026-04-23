@@ -22,11 +22,12 @@ console = Console()
 
 
 def _build_agent(cfg: AgentConfig) -> EulerAgent:
-    if not cfg.api_key:
+    clean_key = cfg.api_key.strip()
+    if not clean_key:
         raise typer.BadParameter(
             "API key is missing. Run: Euler config set --provider <provider> --model <model>"
         )
-    return EulerAgent(provider=cfg.provider, model_name=cfg.model, api_key=cfg.api_key)
+    return EulerAgent(provider=cfg.provider, model_name=cfg.model, api_key=clean_key)
 
 
 @app.callback(invoke_without_command=True)
@@ -58,9 +59,17 @@ def show_config() -> None:
 def set_config(
     provider: Provider = typer.Option(..., help="openai | anthropic | gemini"),
     model: str = typer.Option(..., help="Model slug for provider"),
-    api_key: str = typer.Option(..., prompt=True, hide_input=True),
+    api_key: str = typer.Option(..., prompt=True, hide_input=False),
 ) -> None:
-    cfg = AgentConfig(provider=provider, model=model, api_key=api_key)
+    clean_key = api_key.strip()
+    if not clean_key:
+        raise typer.BadParameter("API key cannot be empty.")
+    if provider == "gemini" and not clean_key.startswith("AIza"):
+        raise typer.BadParameter(
+            "Gemini API keys usually start with 'AIza'. "
+            "Please paste a valid Google AI Studio API key."
+        )
+    cfg = AgentConfig(provider=provider, model=model, api_key=clean_key)
     save_config(cfg)
     console.print("[green]Config saved.[/green]")
 

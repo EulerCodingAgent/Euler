@@ -13,7 +13,7 @@ Provider = Literal["openai", "anthropic", "gemini"]
 
 class AgentConfig(BaseModel):
     provider: Provider = "gemini"
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-2.0-flash"
     api_key: str = Field(default="", repr=False)
 
 

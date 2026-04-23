@@ -76,11 +76,33 @@ class AgentState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 
 def _invoke(model, system_prompt: str, human_prompt: str) -> str:
-    response = model.invoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=human_prompt),
-    ])
-    return response.content if isinstance(response.content, str) else str(response.content)
+    try:
+        response = model.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_prompt),
+        ])
+        return response.content if isinstance(response.content, str) else str(response.content)
+    except Exception as exc:
+        msg = str(exc)
+        if "400" in msg or "Bad Request" in msg:
+            raise RuntimeError(
+                "API returned 400 Bad Request.\n\n"
+                "Most likely causes:\n"
+                "  1) Missing/invalid API key (most common)\n"
+                "  2) API key restrictions or network/proxy rewriting requests\n"
+                "  3) Invalid model slug\n\n"
+                "Quick checks:\n"
+                "  - Run: Euler config show\n"
+                "  - Re-enter your key: Euler config set --provider gemini --model gemini-2.5-flash\n"
+                "  - Ensure the key is from Google AI Studio (usually starts with 'AIza')\n\n"
+                "Common stable Gemini model slugs:\n"
+                "  gemini-2.5-flash\n"
+                "  gemini-2.5-pro\n"
+                "  gemini-2.5-flash-lite\n"
+                "  gemini-2.0-flash\n\n"
+                f"Original error: {msg[:400]}"
+            ) from exc
+        raise
 
 
 def _build_base_context(state: AgentState) -> str:
@@ -250,7 +272,31 @@ class EulerAgent:
             "user_goal": user_goal,
             "workdir": resolved_workdir,
         }
-        result = compiled.invoke(initial)
+        try:
+            result = compiled.invoke(initial)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            msg = str(exc)
+            if "400" in msg or "Bad Request" in msg:
+                raise RuntimeError(
+                    "API returned 400 Bad Request.\n\n"
+                    "Most likely causes:\n"
+                    "  1) Missing/invalid API key (most common)\n"
+                    "  2) API key restrictions or network/proxy rewriting requests\n"
+                    "  3) Invalid model slug\n\n"
+                    "Quick checks:\n"
+                    "  - Run: Euler config show\n"
+                    "  - Re-enter your key: Euler config set --provider gemini --model gemini-2.5-flash\n"
+                    "  - Ensure the key is from Google AI Studio (usually starts with 'AIza')\n\n"
+                    "Common stable Gemini model slugs:\n"
+                    "  gemini-2.5-flash\n"
+                    "  gemini-2.5-pro\n"
+                    "  gemini-2.5-flash-lite\n"
+                    "  gemini-2.0-flash\n\n"
+                    f"Original error: {msg[:400]}"
+                ) from exc
+            raise
         final = result.get("final_output", "No output generated.")
         add_memory(
             project=resolved_workdir,

@@ -18,7 +18,8 @@ pip install -e .
 ## Run
 
 ```bash
-Euler config set --provider openai --model gpt-4o-mini
+# default is already Gemini — just set your key:
+Euler config set --provider gemini --model gemini-2.5-flash
 Euler
 ```
 
@@ -34,6 +35,12 @@ Autonomous build/fix loop:
 Euler autopilot "Fix failing tests and refactor auth module" --verify-command "pytest -q"
 Euler autopilot "Refactor auth module" --policy-profile safe
 Euler autopilot "Implement feature X" --policy-profile aggressive --auto-approve-risky
+```
+
+Convert a file to another language:
+
+```bash
+Euler convert app.py typescript --output app.ts
 ```
 
 Build semantic index and search code:
@@ -53,6 +60,10 @@ Euler graph
   - free-form coding prompts
   - SQL generation via `/sql`
   - selected code replacement via `/replace <file> <start> <end> <instruction>`
+- **Default provider: Gemini (`gemini-2.5-flash`)**
+- 8-specialist parallel agent swarm: architect, coder, tester, security, devops, db, documenter, refactor
+- Production-grade code enforcement in all agents and autopilot writes
+- Cross-language file conversion: `Euler convert <file> <lang>` and REPL `/convert`
 - Autonomous execution loop with retries and command observations
 - Guardrailed autopilot with command allowlist, workdir sandbox, and mutation limits
 - Multi-agent orchestration with specialist roles (planner -> architect/coder/tester in parallel -> arbitrator -> reviewer)

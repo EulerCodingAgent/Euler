@@ -12,8 +12,8 @@ Provider = Literal["openai", "anthropic", "gemini"]
 
 
 class AgentConfig(BaseModel):
-    provider: Provider = "openai"
-    model: str = "gpt-4o-mini"
+    provider: Provider = "gemini"
+    model: str = "gemini-2.5-flash"
     api_key: str = Field(default="", repr=False)
 
 

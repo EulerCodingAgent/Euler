@@ -27,15 +27,17 @@ def run_repl(agent: EulerAgent) -> None:
             break
         if user_input == "/help":
             console.print(
-                "/exit | /quit\n"
-                "/sql <requirement>\n"
-                "/replace <file> <start_line> <end_line> <instruction>\n"
-                "/auto <goal> [verify_command]\n"
-                "/memory <query>\n"
-                "/index [full]\n"
-                "/search <query>\n"
-                "/graph\n"
-                "or write a normal prompt for full-task execution."
+                "[bold]Euler REPL commands[/bold]\n"
+                "  /sql <requirement>               — production-grade SQL generation\n"
+                "  /replace <file> <s> <e> <instr>  — rewrite selected line range\n"
+                "  /convert <file> <target_lang>    — convert file to another language\n"
+                "  /convert-code <src_lang>→<tgt_lang> — paste code, convert inline\n"
+                "  /auto <goal> [| <verify_cmd>]    — run autopilot loop\n"
+                "  /memory <query>                  — search past session memory\n"
+                "  /index [full]                    — build/update semantic index\n"
+                "  /search <query>                  — semantic code search\n"
+                "  /graph                           — build cross-language code graph\n"
+                "  /exit | /quit                    — exit REPL"
             )
             continue
 
@@ -115,6 +117,40 @@ def run_repl(agent: EulerAgent) -> None:
 
         if user_input == "/graph":
             console.print(build_code_graph(str(Path.cwd())))
+            continue
+
+        if user_input.startswith("/convert "):
+            parts = user_input.split(" ", 2)
+            if len(parts) < 3:
+                console.print("[red]usage: /convert <file> <target_lang>[/red]")
+                continue
+            _, file_path, target_lang = parts
+            console.print(f"[cyan]Converting {file_path} → {target_lang}...[/cyan]")
+            result = agent.convert_file(file_path.strip(), target_lang.strip())
+            console.print(result)
+            continue
+
+        if user_input.startswith("/convert-code "):
+            spec = user_input.removeprefix("/convert-code ").strip()
+            if "→" not in spec and "->" not in spec:
+                console.print("[red]usage: /convert-code <src_lang>→<tgt_lang>[/red]")
+                continue
+            arrow = "→" if "→" in spec else "->"
+            src_lang, tgt_lang = [p.strip() for p in spec.split(arrow, 1)]
+            console.print(f"[cyan]Paste source code, then a line with just '---' to convert:[/cyan]")
+            lines: list[str] = []
+            while True:
+                line = console.input("")
+                if line.strip() == "---":
+                    break
+                lines.append(line)
+            source_code = "\n".join(lines)
+            if not source_code.strip():
+                console.print("[yellow]No code provided.[/yellow]")
+                continue
+            console.print(f"[cyan]Converting {src_lang} → {tgt_lang}...[/cyan]")
+            result = agent.convert_language(source_code, src_lang, tgt_lang)
+            console.print(result)
             continue
 
         output = agent.run(user_input)

@@ -11,6 +11,7 @@ from rich.console import Console
 
 from euler_agent.agent import EulerAgent
 from euler_agent.audit import append_audit_event, create_audit_run
+from euler_agent.prompts import PRODUCTION_PREAMBLE  # noqa: F401 — imported for side-effect awareness
 from euler_agent.guardrails import (
     build_policy,
     ensure_inside_workdir,
@@ -125,25 +126,39 @@ def run_autopilot(
         round_snapshot.mkdir(parents=True, exist_ok=True)
         touched_files: set[Path] = set()
         planner_prompt = (
-            "Return valid JSON only in this schema:\n"
-            '{'
-            '"summary":"short summary",'
-            '"actions":[{"type":"read_file|write_file|append_file|replace_range|replace_in_files|run_command|done",'
-            '"path":"optional","content":"optional","start_line":0,"end_line":0,'
-            '"search":"optional","replacement":"optional","paths":[],"command":"optional","reason":"optional"}]'
-            "}\n\n"
-            "Rules:\n"
-            "- Use relative paths under the provided workdir.\n"
-            "- Use run_command for tests/build.\n"
-            "- If objective is complete, return one action with type=done.\n\n"
-            f"- Max actions per round: {policy.max_actions_per_round}\n"
-            f"- Remaining file mutations: {policy.max_file_mutations - mutation_count}\n"
-            f"Goal:\n{goal}\n\n"
-            f"Workdir:\n{wd}\n\n"
-            f"Recent observation:\n{observation}\n\n"
-            f"Action history:\n{chr(10).join(history[-8:]) or 'None'}"
+            "You are Euler Autopilot — an autonomous production-grade coding agent.\n\n"
+            "## Code Quality Non-Negotiables\n"
+            "Every file you write or modify MUST be:\n"
+            "- Complete and immediately runnable — no stubs, no ellipsis, no TODOs.\n"
+            "- Production-ready with error handling, logging, and type hints.\n"
+            "- Idiomatic for the target language.\n"
+            "- Free of hard-coded secrets; use environment variables via a config layer.\n"
+            "- Using parameterised queries for any SQL.\n"
+            "- Consistent in naming and style with the existing codebase.\n\n"
+            "## Action Schema\n"
+            "Return valid JSON ONLY (no markdown, no prose) in this exact schema:\n"
+            '{"summary":"<one line>","actions":['
+            '{"type":"read_file|write_file|append_file|replace_range|replace_in_files|run_command|done",'
+            '"path":"<relative>","content":"<full file content when writing>",'
+            '"start_line":0,"end_line":0,'
+            '"search":"<exact text>","replacement":"<replacement text>",'
+            '"paths":[],"command":"<shell command>","reason":"<why>"}'
+            "]}\n\n"
+            "## Strict Rules\n"
+            "- All paths MUST be relative to workdir.\n"
+            "- write_file content must be the COMPLETE file — never partial.\n"
+            "- Use run_command only for: install deps, run tests, build.\n"
+            "- If the goal is fully achieved, emit a single done action.\n"
+            "- Prefer targeted replace_range over full rewrites when only a section changes.\n"
+            "- Never emit more than the allowed actions per round.\n\n"
+            f"- Max actions this round: {policy.max_actions_per_round}\n"
+            f"- Remaining file mutation budget: {policy.max_file_mutations - mutation_count}\n\n"
+            f"## Goal\n{goal}\n\n"
+            f"## Workdir\n{wd}\n\n"
+            f"## Observations from previous round\n{observation}\n\n"
+            f"## Action history (last 10)\n{chr(10).join(history[-10:]) or 'None'}"
         )
-        plan_text = agent.ask(planner_prompt, role="autonomous-builder")
+        plan_text = agent.ask(planner_prompt, role="autonomous-production-builder")
         append_audit_event(
             audit_file,
             {

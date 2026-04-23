@@ -204,5 +204,26 @@ def graph(
     console.print(f"[green]{message}[/green]")
 
 
+@app.command("convert")
+def convert_file(
+    file: Path = typer.Argument(..., help="Source file to convert"),
+    target_lang: str = typer.Argument(
+        ...,
+        help="Target language (python|typescript|javascript|go|rust|java|kotlin|sql|...)",
+    ),
+    output: Optional[Path] = typer.Option(None, help="Write converted code to this file"),
+) -> None:
+    cfg = load_config()
+    print_activation_banner(cfg.provider, cfg.model)
+    agent = _build_agent(cfg)
+    console.print(f"[cyan]Converting {file} → {target_lang}...[/cyan]")
+    result = agent.convert_file(str(file), target_lang)
+    if output:
+        output.write_text(result, encoding="utf-8")
+        console.print(f"[green]Written to {output}[/green]")
+    else:
+        console.print(result)
+
+
 if __name__ == "__main__":
     app()

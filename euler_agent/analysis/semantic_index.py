@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from euler_agent.tfidf import cosine_sparse, embed
+from euler_agent.analysis.tfidf import cosine_sparse, embed
 
 SUPPORTED_EXTENSIONS = {
     ".py", ".md", ".txt", ".json",

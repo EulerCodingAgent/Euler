@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from euler_agent.tfidf import cosine_sparse, embed
+from euler_agent.analysis.tfidf import cosine_sparse, embed
 
 MEMORY_DIR = Path.home() / ".euler_agent"
 MEMORY_FILE = MEMORY_DIR / "memory.json"

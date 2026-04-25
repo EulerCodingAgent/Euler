@@ -9,7 +9,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
-from euler_agent.config import Provider
+from euler_agent.config.settings import Provider
 
 
 def get_chat_model(provider: Provider, model: str, api_key: str) -> BaseChatModel:

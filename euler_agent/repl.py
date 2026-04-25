@@ -12,12 +12,12 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 
-from euler_agent.agent import EulerAgent
-from euler_agent.autopilot import run_autopilot
-from euler_agent.code_graph import build_code_graph
-from euler_agent.memory import search_memory
-from euler_agent.semantic_index import index_path, search_index
-from euler_agent.tools import read_file, replace_range, write_file
+from euler_agent.core.agent import EulerAgent
+from euler_agent.core.autopilot import run_autopilot
+from euler_agent.analysis.code_graph import build_code_graph
+from euler_agent.memory.store import search_memory
+from euler_agent.analysis.semantic_index import index_path, search_index
+from euler_agent.tools.ops import read_file, replace_range, write_file
 
 
 # ── patterns & constants ──────────────────────────────────────────────────────

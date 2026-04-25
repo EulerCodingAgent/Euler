@@ -23,9 +23,9 @@ from typing import TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from euler_agent.context import load_euler_instruction_docs
-from euler_agent.memory import add_memory, search_memory
-from euler_agent.prompts import (
+from euler_agent.config.context import load_euler_instruction_docs
+from euler_agent.memory.store import add_memory, search_memory
+from euler_agent.core.prompts import (
     SYSTEM_ARCHITECT,
     SYSTEM_ARBITRATOR,
     SYSTEM_CODER,
@@ -38,8 +38,8 @@ from euler_agent.prompts import (
     SYSTEM_SECURITY,
     SYSTEM_TESTER,
 )
-from euler_agent.providers import get_chat_model
-from euler_agent.semantic_index import search_index
+from euler_agent.core.providers import get_chat_model
+from euler_agent.analysis.semantic_index import search_index
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ class EulerAgent:
         self.model = get_chat_model(provider=provider, model=model_name, api_key=api_key)
 
     def ask(self, prompt: str, role: str = "assistant") -> str:
-        from euler_agent.prompts import PRODUCTION_PREAMBLE
+        from euler_agent.core.prompts import PRODUCTION_PREAMBLE
         system = f"{PRODUCTION_PREAMBLE}\n\nYou are Euler acting as {role}."
         return _invoke(self.model, system, prompt)
 
@@ -307,7 +307,7 @@ class EulerAgent:
         return final
 
     def generate_sql(self, requirement: str) -> str:
-        from euler_agent.prompts import SYSTEM_DB
+        from euler_agent.core.prompts import SYSTEM_DB
         prompt = (
             f"Generate production-ready SQL for this requirement.\n\n"
             f"Requirement:\n{requirement}\n\n"
@@ -323,7 +323,7 @@ class EulerAgent:
         selected_text: str,
         instruction: str,
     ) -> str:
-        from euler_agent.prompts import PRODUCTION_PREAMBLE
+        from euler_agent.core.prompts import PRODUCTION_PREAMBLE
         system = (
             f"{PRODUCTION_PREAMBLE}\n\n"
             "You rewrite a selected code region according to an instruction. "
@@ -343,10 +343,10 @@ class EulerAgent:
         source_lang: str,
         target_lang: str,
     ) -> str:
-        from euler_agent.lang_converter import convert_code, analyse_migration
+        from euler_agent.tools.converter import convert_code, analyse_migration
         analysis = analyse_migration(self.model, source_code, source_lang, target_lang)
         return convert_code(self.model, source_code, source_lang, target_lang, analysis)
 
     def convert_file(self, file_path: str, target_lang: str) -> str:
-        from euler_agent.lang_converter import convert_file
+        from euler_agent.tools.converter import convert_file
         return convert_file(self.model, file_path, target_lang)

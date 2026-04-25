@@ -9,17 +9,17 @@ from typing import Any
 
 from rich.console import Console
 
-from euler_agent.agent import EulerAgent
-from euler_agent.audit import append_audit_event, create_audit_run
-from euler_agent.prompts import PRODUCTION_PREAMBLE  # noqa: F401 — imported for side-effect awareness
-from euler_agent.guardrails import (
+from euler_agent.core.agent import EulerAgent
+from euler_agent.memory.audit import append_audit_event, create_audit_run
+from euler_agent.core.prompts import PRODUCTION_PREAMBLE  # noqa: F401 — imported for side-effect awareness
+from euler_agent.guards.guardrails import (
     build_policy,
     ensure_inside_workdir,
     is_command_allowed,
     is_risky_command,
 )
-from euler_agent.safety import guarded_replace_range, guarded_write
-from euler_agent.tools import (
+from euler_agent.guards.safety import guarded_replace_range, guarded_write
+from euler_agent.tools.ops import (
     append_file,
     read_file,
     replace_in_files,

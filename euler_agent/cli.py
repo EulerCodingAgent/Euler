@@ -8,13 +8,13 @@ from typing import Optional
 import typer
 from rich.console import Console
 
-from euler_agent.agent import EulerAgent
-from euler_agent.autopilot import run_autopilot
-from euler_agent.avatar import print_activation_banner
-from euler_agent.code_graph import build_code_graph
-from euler_agent.config import AgentConfig, Provider, load_config, save_config
-from euler_agent.memory import search_memory
-from euler_agent.semantic_index import index_path, search_index
+from euler_agent.core.agent import EulerAgent
+from euler_agent.core.autopilot import run_autopilot
+from euler_agent.ui.avatar import print_activation_banner
+from euler_agent.analysis.code_graph import build_code_graph
+from euler_agent.config.settings import AgentConfig, Provider, load_config, save_config
+from euler_agent.memory.store import search_memory
+from euler_agent.analysis.semantic_index import index_path, search_index
 from euler_agent.repl import run_repl
 
 app = typer.Typer(help="Euler coding agent CLI")

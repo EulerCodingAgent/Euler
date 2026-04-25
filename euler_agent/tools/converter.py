@@ -4,7 +4,7 @@ Cross-language conversion and migration engine.
 
 from __future__ import annotations
 
-from euler_agent.prompts import SYSTEM_LANG_ANALYSER, SYSTEM_LANG_CONVERTER
+from euler_agent.core.prompts import SYSTEM_LANG_ANALYSER, SYSTEM_LANG_CONVERTER
 
 SUPPORTED_LANGUAGES = {
     "python", "javascript", "typescript", "go", "rust", "java",

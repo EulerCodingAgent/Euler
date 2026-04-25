@@ -13,3 +13,5 @@ venv
 *.pyzwzw
 
 Euler_Agent.egg-info
+
+test

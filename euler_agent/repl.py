@@ -21,6 +21,12 @@ from euler_agent.tools import read_file, replace_range, write_file
 # ── patterns ──────────────────────────────────────────────────────────────────
 
 _FILE_REF_PATTERN = re.compile(r"@([^\s]+)")
+
+# Words that signal the user wants to DELETE the referenced files, not patch them
+_DELETE_WORDS = frozenset({
+    "delete", "remove", "rm", "erase", "wipe", "unlink",
+    "get rid", "trash", "clean up", "cleanup",
+})
 _RANGED_FILE_REF_PATTERN = re.compile(r"^(?P<path>.+):(?P<start>\d+)-(?P<end>\d+)$")
 
 # Matches ```lang\n<body>\n``` (captures body)
@@ -329,11 +335,14 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
             "  /graph                           — build cross-language code graph\n"
             "  @file.ext                        — attach full file to your prompt\n"
             "  @file.ext:start-end              — attach a line range to your prompt\n"
+            "  /delete @file1 @file2 ...        — delete files (with confirmation)\n"
             "  /exit | /quit                    — exit REPL\n\n"
             "[dim]Examples:\n"
             "  fix @ema.py\n"
             "  explain @ema.py:17-22\n"
-            "  refactor @euler_agent/repl.py[/dim]"
+            "  refactor @euler_agent/repl.py\n"
+            "  delete @ema.py @calculator.py\n"
+            "  /delete @ema.py @calculator.py[/dim]"
         )
         return
 
@@ -375,6 +384,12 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
             console.print(f"[bold green]\u2713 {escape(message)}[/bold green]")
         except Exception as exc:
             _print_error(console, exc)
+        return
+
+    # ── /delete ───────────────────────────────────────────────────────────────
+    if user_input.startswith("/delete "):
+        raw_paths = user_input.removeprefix("/delete ").split()
+        _handle_delete_command(console, raw_paths)
         return
 
     # ── /auto ─────────────────────────────────────────────────────────────────
@@ -493,11 +508,63 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
     _handle_freeform(console, agent, user_input)
 
 
+def _handle_delete_command(console: Console, raw_paths: list[str]) -> None:
+    """Resolve, confirm, and delete files listed explicitly via /delete."""
+    resolved: list[Path] = []
+    for rp in raw_paths:
+        ref = rp.lstrip("@").rstrip(".,;:!?)]}")
+        candidate = Path(ref)
+        if not candidate.is_absolute():
+            candidate = (Path.cwd() / ref).resolve()
+        if not candidate.exists():
+            console.print(f"[yellow]Not found: {escape(str(candidate))}[/yellow]")
+        elif not candidate.is_file():
+            console.print(f"[yellow]Not a file: {escape(str(candidate))}[/yellow]")
+        else:
+            resolved.append(candidate)
+
+    if not resolved:
+        return
+
+    console.print("[bold]Files to delete:[/bold]")
+    for p in resolved:
+        console.print(f"  [red]{escape(str(p))}[/red]")
+    try:
+        confirm = console.input("Confirm delete? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
+
+    if confirm not in {"y", "yes"}:
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
+
+    for p in resolved:
+        try:
+            p.unlink()
+            console.print(f"[bold green]\u2713 Deleted:[/bold green] {escape(str(p.name))}")
+        except Exception as exc:
+            console.print(f"[red]Failed to delete {escape(str(p))}: {escape(str(exc))}[/red]")
+
+
+def _detect_delete_intent(user_input: str, ref_paths: set[Path]) -> bool:
+    """Return True if the user wants to DELETE the referenced files."""
+    if not ref_paths:
+        return False
+    text = user_input.strip().lower()
+    return any(word in text for word in _DELETE_WORDS)
+
+
 def _handle_freeform(console: Console, agent: EulerAgent, user_input: str) -> None:
     """Route free-form prompts, inject file content, call agent, apply patches."""
     expanded_input, notes, ref_paths = _expand_file_references(user_input)
     for note in notes:
         console.print(note)
+
+    # ── delete intent: user asked to remove/delete/rm the @files ─────────────
+    if _detect_delete_intent(user_input, ref_paths):
+        _handle_delete_command(console, [str(p) for p in ref_paths])
+        return
 
     is_quick = _should_use_quick_ask(user_input)
     has_file_refs = bool(ref_paths)

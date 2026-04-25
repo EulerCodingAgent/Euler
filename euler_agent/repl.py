@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import re
 from ast import parse as ast_parse
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.syntax import Syntax
 
 from euler_agent.agent import EulerAgent
 from euler_agent.autopilot import run_autopilot
@@ -18,9 +20,33 @@ from euler_agent.semantic_index import index_path, search_index
 from euler_agent.tools import read_file, replace_range, write_file
 
 
-# ── patterns ──────────────────────────────────────────────────────────────────
+# ── patterns & constants ──────────────────────────────────────────────────────
 
 _FILE_REF_PATTERN = re.compile(r"@([^\s]+)")
+
+# File extensions treated as readable code/text when attaching a folder
+_CODE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp",
+    ".cs", ".rb", ".php", ".swift", ".kt", ".scala",
+    ".r", ".sql", ".sh", ".bash", ".zsh", ".ps1",
+    ".yaml", ".yml", ".toml", ".json", ".jsonc",
+    ".md", ".txt", ".env", ".cfg", ".ini", ".conf",
+    ".html", ".css", ".scss", ".sass", ".less",
+    ".xml", ".proto", ".graphql",
+})
+
+# Directories to skip when attaching a folder
+_SKIP_DIRS: frozenset[str] = frozenset({
+    "__pycache__", ".git", ".hg", ".svn",
+    "node_modules", ".venv", "venv", ".env",
+    "dist", "build", "out", "target", ".cache",
+    ".idea", ".vscode", ".mypy_cache", ".pytest_cache",
+    ".tox", "coverage", ".ruff_cache", "site-packages",
+})
+
+# Maximum files to attach from a single folder reference
+_FOLDER_FILE_LIMIT = 40
 
 # Words that signal the user wants to DELETE the referenced files, not patch them
 _DELETE_WORDS = frozenset({
@@ -55,23 +81,19 @@ _QUESTION_FIRST_WORDS = frozenset({
 })
 
 
-# ── patch extraction ───────────────────────────────────────────────────────────
+# ── patch extraction & approval ────────────────────────────────────────────────
 
-def _extract_and_apply_patches(
+def _extract_patches(
     response: str,
     console: Console,
     workdir: Path,
     allowed_files: set[Path],
-) -> list[Path]:
+) -> list[tuple[Path, str]]:
     """
-    Scan `response` for fenced code blocks whose first line is a file-path comment
-    (e.g. ``# ema.py`` or ``// app.ts``). For every match that is inside `workdir`,
-    validate Python AST if applicable, then write the file.
-
-    If `allowed_files` is non-empty and only one file is referenced, use it as a
-    fallback when the block has no path comment.
+    Scan LLM response for fenced code blocks and return (path, new_content) pairs.
+    Nothing is written to disk here — writing happens only after user approval.
     """
-    written: list[Path] = []
+    patches: list[tuple[Path, str]] = []
     seen: set[Path] = set()
 
     for block_match in _CODE_BLOCK_RE.finditer(response):
@@ -89,8 +111,7 @@ def _extract_and_apply_patches(
             # Fallback 1: lone allowed file → use it unambiguously
             if len(allowed_files) == 1:
                 candidate = next(iter(allowed_files))
-            # Fallback 2: match an allowed file whose name appears in any
-            # comment within the first 5 lines of the block
+            # Fallback 2: match by filename appearing in the block header
             elif allowed_files:
                 candidate = None
                 header = "\n".join(lines[:5]).lower()
@@ -103,9 +124,19 @@ def _extract_and_apply_patches(
             else:
                 continue
         else:
-            candidate = Path(raw_path)
-            if not candidate.is_absolute():
-                candidate = (workdir / candidate).resolve()
+            parsed = Path(raw_path)
+            # Priority: match against the @-referenced files by name/relative path.
+            # This ensures "# ema.py" resolves to the exact file the user attached,
+            # not a guessed workdir-relative path.
+            candidate = None
+            for af in allowed_files:
+                norm_raw = raw_path.replace("\\", "/")
+                norm_af  = str(af).replace("\\", "/")
+                if af.name == parsed.name or norm_af.endswith("/" + norm_raw):
+                    candidate = af
+                    break
+            if candidate is None:
+                candidate = parsed if parsed.is_absolute() else (workdir / parsed).resolve()
 
         # Safety: must stay inside workdir
         try:
@@ -124,20 +155,111 @@ def _extract_and_apply_patches(
         if not code.strip():
             continue
 
-        # Python AST validation before overwriting
+        # Python AST validation (reject before even showing diff)
         if candidate.suffix == ".py":
             try:
                 ast_parse(code)
             except SyntaxError as exc:
                 console.print(
-                    f"[yellow]Skipped {escape(str(candidate))} — "
+                    f"[yellow]Skipped {escape(candidate.name)} — "
                     f"syntax error: {escape(str(exc))}[/yellow]"
                 )
                 continue
 
-        candidate.parent.mkdir(parents=True, exist_ok=True)
-        candidate.write_text(code, encoding="utf-8")
-        written.append(candidate)
+        patches.append((candidate, code))
+
+    return patches
+
+
+def _show_diff(console: Console, path: Path, old: str, new: str) -> None:
+    """Render a colored unified diff between old and new content."""
+    diff_lines = list(difflib.unified_diff(
+        old.splitlines(keepends=True),
+        new.splitlines(keepends=True),
+        fromfile=f"a/{path.name}",
+        tofile=f"b/{path.name}",
+        lineterm="",
+    ))
+    if not diff_lines:
+        console.print(f"  [dim](no textual changes)[/dim]")
+        return
+    diff_text = "\n".join(diff_lines)
+    console.print(Syntax(diff_text, "diff", theme="monokai", line_numbers=False))
+
+
+def _review_and_apply(
+    patches: list[tuple[Path, str]],
+    console: Console,
+    workdir: Path,
+) -> list[Path]:
+    """
+    For each proposed patch, show a diff and ask for approval.
+    Options: [y]es  [n]o  [a]ll  [q]uit
+    Returns the list of files actually written.
+    """
+    if not patches:
+        return []
+
+    written: list[Path] = []
+    apply_all = False
+
+    for path, new_content in patches:
+        old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+        is_new = not path.exists()
+
+        if old_content == new_content:
+            console.print(f"[dim]{path.name}: no changes[/dim]")
+            continue
+
+        # ── show header + diff ────────────────────────────────────────────────
+        console.print()
+        if is_new:
+            console.print(
+                Panel(f"[bold cyan]New file:[/bold cyan] {escape(path.name)}", padding=(0, 1))
+            )
+        else:
+            try:
+                rel = path.relative_to(workdir)
+            except ValueError:
+                rel = path
+            console.print(
+                Panel(
+                    f"[bold cyan]Proposed changes:[/bold cyan] {escape(str(rel))}",
+                    padding=(0, 1),
+                )
+            )
+        _show_diff(console, path, old_content, new_content)
+
+        if apply_all:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(new_content, encoding="utf-8")
+            written.append(path)
+            console.print(f"[bold green]APPLIED[/bold green] {escape(path.name)}")
+            continue
+
+        # ── prompt ────────────────────────────────────────────────────────────
+        try:
+            choice = console.input(
+                "\nApply? [y]es / [n]o / [a]ll / [q]uit: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[yellow]Cancelled.[/yellow]")
+            break
+
+        if choice in {"a", "all"}:
+            apply_all = True
+            choice = "y"
+
+        if choice in {"y", "yes"}:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(new_content, encoding="utf-8")
+            written.append(path)
+            console.print(f"[bold green]APPLIED[/bold green] {escape(path.name)}")
+        elif choice in {"q", "quit"}:
+            console.print("[yellow]Stopped — remaining changes discarded.[/yellow]")
+            break
+        else:
+            console.print(f"[yellow]SKIPPED[/yellow] {escape(path.name)}")
 
     return written
 
@@ -157,6 +279,71 @@ def _should_use_quick_ask(user_input: str) -> bool:
     if first_word in _QUESTION_FIRST_WORDS:
         return True
     return True
+
+
+# ── folder attachment helper ──────────────────────────────────────────────────
+
+def _collect_folder_files(folder: Path) -> list[Path]:
+    """Walk a folder and return code files, skipping noise directories."""
+    files: list[Path] = []
+    for candidate in sorted(folder.rglob("*")):
+        if not candidate.is_file():
+            continue
+        if candidate.suffix.lower() not in _CODE_EXTENSIONS:
+            continue
+        # Skip if any path component is a noise directory
+        if any(part in _SKIP_DIRS for part in candidate.parts):
+            continue
+        files.append(candidate)
+        if len(files) >= _FOLDER_FILE_LIMIT:
+            break
+    return files
+
+
+def _attach_folder(
+    folder: Path,
+    ref: str,
+    notes: list[str],
+    ref_paths: set[Path],
+) -> str:
+    """Build a multi-file context block for an entire folder reference."""
+    files = _collect_folder_files(folder)
+    if not files:
+        notes.append(f"[yellow]No code files found in @{escape(ref)}[/yellow]")
+        return f"@{ref}"
+
+    truncated = len(files) >= _FOLDER_FILE_LIMIT
+
+    blocks: list[str] = []
+    attached: list[str] = []
+    for f in files:
+        try:
+            content = read_file(str(f))
+        except Exception as exc:
+            notes.append(f"[yellow]Skipped {escape(f.name)}: {escape(str(exc))}[/yellow]")
+            continue
+        try:
+            rel = f.relative_to(folder.parent)
+        except ValueError:
+            rel = f
+        blocks.append(
+            f"### {rel}\n"
+            f"[Attached file: {f}]\n"
+            f"```text\n{content}\n```"
+        )
+        ref_paths.add(f)
+        attached.append(f.name)
+
+    suffix = f" (first {_FOLDER_FILE_LIMIT})" if truncated else ""
+    notes.append(
+        f"[cyan]Attached @{escape(ref)}/ "
+        f"({len(attached)} files{suffix})[/cyan]"
+    )
+    header = (
+        f"@{ref}/\n"
+        f"[Attached folder: {folder} — {len(attached)} files{suffix}]"
+    )
+    return header + "\n\n" + "\n\n".join(blocks)
 
 
 # ── file reference expansion ──────────────────────────────────────────────────
@@ -189,7 +376,19 @@ def _expand_file_references(
         candidate = Path(ref)
         if not candidate.is_absolute():
             candidate = (Path.cwd() / ref).resolve()
-        if not candidate.exists() or not candidate.is_file():
+        if not candidate.exists():
+            notes.append(f"[yellow]Could not resolve @{escape(ref)}[/yellow]")
+            return match.group(0)
+
+        # ── folder attachment ─────────────────────────────────────────────────
+        if candidate.is_dir():
+            if line_start is not None:
+                notes.append(
+                    f"[yellow]Line ranges are not supported on folders (@{escape(raw_ref)})[/yellow]"
+                )
+            return _attach_folder(candidate, ref, notes, ref_paths)
+
+        if not candidate.is_file():
             notes.append(f"[yellow]Could not resolve @{escape(ref)}[/yellow]")
             return match.group(0)
         try:
@@ -335,12 +534,15 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
             "  /graph                           — build cross-language code graph\n"
             "  @file.ext                        — attach full file to your prompt\n"
             "  @file.ext:start-end              — attach a line range to your prompt\n"
+            "  @folder/                         — attach all code files in a folder\n"
             "  /delete @file1 @file2 ...        — delete files (with confirmation)\n"
             "  /exit | /quit                    — exit REPL\n\n"
             "[dim]Examples:\n"
             "  fix @ema.py\n"
             "  explain @ema.py:17-22\n"
             "  refactor @euler_agent/repl.py\n"
+            "  review all code in @euler_agent/\n"
+            "  fix bugs in @euler_agent/ and @ema.py\n"
             "  delete @ema.py @calculator.py\n"
             "  /delete @ema.py @calculator.py[/dim]"
         )
@@ -381,7 +583,7 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
             with console.status("[bold cyan]Rewriting selection...[/bold cyan]", spinner="dots"):
                 replacement = agent.rewrite_selection(str(target), selected_text, instruction)
             message = replace_range(str(target), start_line, end_line, replacement)
-            console.print(f"[bold green]\u2713 {escape(message)}[/bold green]")
+            console.print(f"[bold green]DONE:[/bold green] {escape(message)}")
         except Exception as exc:
             _print_error(console, exc)
         return
@@ -542,7 +744,7 @@ def _handle_delete_command(console: Console, raw_paths: list[str]) -> None:
     for p in resolved:
         try:
             p.unlink()
-            console.print(f"[bold green]\u2713 Deleted:[/bold green] {escape(str(p.name))}")
+            console.print(f"[bold green]DELETED:[/bold green] {escape(str(p.name))}")
         except Exception as exc:
             console.print(f"[red]Failed to delete {escape(str(p))}: {escape(str(exc))}[/red]")
 
@@ -651,15 +853,16 @@ def _apply_and_report(
     workdir: Path,
     ref_paths: set[Path],
 ) -> None:
-    """Extract code blocks from LLM output and write files; print a tick per file."""
-    written = _extract_and_apply_patches(output, console, workdir, ref_paths)
-    if written:
-        console.print()
-        for path in written:
-            rel = path.relative_to(workdir) if path.is_relative_to(workdir) else path
-            console.print(f"[bold green]\u2713 Patched:[/bold green] {escape(str(rel))}")
-    elif ref_paths:
-        console.print(
-            "[dim]No file patch detected in response. "
-            "Use /replace for targeted line edits.[/dim]"
-        )
+    """
+    Extract patches from the LLM response, show a diff for each, ask for
+    approval, and only then write the approved files.
+    """
+    patches = _extract_patches(output, console, workdir, ref_paths)
+    if not patches:
+        if ref_paths:
+            console.print(
+                "[dim]No file patch detected in response. "
+                "Use /replace for targeted line edits.[/dim]"
+            )
+        return
+    _review_and_apply(patches, console, workdir)

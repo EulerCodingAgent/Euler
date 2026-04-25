@@ -19,6 +19,16 @@ from euler_agent.memory.store import search_memory
 from euler_agent.analysis.semantic_index import index_path, search_index
 from euler_agent.tools.ops import read_file, replace_range, write_file
 
+# ── prompt_toolkit (optional — graceful fallback to plain input) ──────────────
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.styles import Style
+    _PT_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PT_AVAILABLE = False
+
 
 # ── patterns & constants ──────────────────────────────────────────────────────
 
@@ -485,17 +495,108 @@ def _print_error(console: Console, exc: Exception) -> None:
         print(f"\nError: {raw_msg[:400]}\n")
 
 
+# ── @ auto-completer ──────────────────────────────────────────────────────────
+
+if _PT_AVAILABLE:
+    class _AtCompleter(Completer):
+        """Complete @path references as the user types them.
+
+        Triggers whenever the cursor is inside a ``@…`` token.
+        Shows matching files and folders from cwd, with subdirectory
+        drilling (e.g. ``@euler_agent/c`` shows files starting with "c"
+        inside the euler_agent/ folder).
+        """
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+
+            # Find the nearest @ that hasn't been closed by a space
+            at_pos = text.rfind("@")
+            if at_pos == -1:
+                return
+            after_at = text[at_pos + 1:]
+            if " " in after_at:
+                return  # @ reference already completed
+
+            after_at = after_at.replace("\\", "/")
+            cwd = Path.cwd()
+
+            # Split into directory prefix + filename prefix
+            if "/" in after_at:
+                dir_part, name_prefix = after_at.rsplit("/", 1)
+                base_dir = cwd / dir_part
+            else:
+                dir_part = ""
+                name_prefix = after_at
+                base_dir = cwd
+
+            if not base_dir.is_dir():
+                return
+
+            try:
+                entries = sorted(
+                    base_dir.iterdir(),
+                    key=lambda p: (p.is_file(), p.name.lower()),
+                )
+            except PermissionError:
+                return
+
+            for entry in entries:
+                name = entry.name
+                # Skip hidden files and known noisy dirs
+                if name.startswith(".") or name in _SKIP_DIRS:
+                    continue
+                if not name.lower().startswith(name_prefix.lower()):
+                    continue
+
+                is_dir = entry.is_dir()
+                suffix = "/" if is_dir else ""
+                display_meta = "dir" if is_dir else (entry.suffix or "file")
+
+                yield Completion(
+                    name + suffix,
+                    start_position=-len(name_prefix),
+                    display=name + suffix,
+                    display_meta=display_meta,
+                )
+
+    _PT_STYLE = Style.from_dict({
+        "prompt":          "bold ansigreen",
+        "completion-menu.completion":          "bg:#1e1e2e fg:#cdd6f4",
+        "completion-menu.completion.current":  "bg:#89b4fa fg:#1e1e2e bold",
+        "completion-menu.meta.completion":     "fg:#6c7086",
+        "completion-menu.meta.completion.current": "fg:#1e1e2e",
+    })
+
+    def _make_session() -> "PromptSession":
+        history_file = Path.home() / ".euler_agent" / "repl_history"
+        history_file.parent.mkdir(parents=True, exist_ok=True)
+        return PromptSession(
+            history=FileHistory(str(history_file)),
+            completer=_AtCompleter(),
+            complete_while_typing=True,
+            style=_PT_STYLE,
+            mouse_support=False,
+        )
+
+
 # ── REPL entry point ──────────────────────────────────────────────────────────
 
 def run_repl(agent: EulerAgent) -> None:
     console = Console()
     console.print(
-        "[bold cyan]Euler REPL[/bold cyan] — type [bold]/help[/bold] for commands"
+        "[bold cyan]Euler REPL[/bold cyan] — type [bold]/help[/bold] for commands, "
+        "[bold]@[/bold] to reference files/folders"
     )
+
+    session = _make_session() if _PT_AVAILABLE else None
 
     while True:
         try:
-            user_input = console.input("[bold green]euler> [/bold green]").strip()
+            if session is not None:
+                user_input = session.prompt("euler> ").strip()
+            else:
+                user_input = console.input("[bold green]euler> [/bold green]").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]bye[/yellow]")
             break

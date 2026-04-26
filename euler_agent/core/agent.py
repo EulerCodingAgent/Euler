@@ -1,10 +1,14 @@
 """
-Multi-agent orchestration engine.
+Multi-agent orchestration engine — with token optimisation.
 
-Graph:  planner
+Graph:  classify_query
+           │
+        gather_context
+           │
+         planner
            │
     ┌──────┴──────────────────────────────────────┐
-    │         parallel_specialists (8 agents)      │
+    │   parallel_specialists (selective subset)    │
     │  architect · coder · tester · security       │
     │  devops · db · documenter · refactor         │
     └──────────────────┬──────────────────────────┘
@@ -12,10 +16,18 @@ Graph:  planner
                   arbitrator
                        │
                    reviewer ──► END
+
+Token optimisation applied at each stage:
+  - classify_query   : decides complexity tier & which specialists to invoke
+  - gather_context   : relevance-gated injection (cosine threshold)
+  - parallel_specialists : only the selected subset is called
+  - arbitrator       : specialist outputs are capped before aggregation
+  - run()            : response cache checked before the graph runs
 """
 
 from __future__ import annotations
 
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TypedDict
@@ -24,7 +36,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from euler_agent.config.context import load_euler_instruction_docs
-from euler_agent.memory.store import add_memory, search_memory
+from euler_agent.memory.store import add_memory, search_memory_scored
 from euler_agent.core.prompts import (
     SYSTEM_ARCHITECT,
     SYSTEM_ARBITRATOR,
@@ -39,7 +51,19 @@ from euler_agent.core.prompts import (
     SYSTEM_TESTER,
 )
 from euler_agent.core.providers import get_chat_model
-from euler_agent.analysis.semantic_index import search_index
+from euler_agent.analysis.semantic_index import search_index_scored
+from euler_agent.optimization.token_optimizer import (
+    QueryComplexity,
+    TokenOptimizer,
+    OptimizationResult,
+)
+
+
+# ---------------------------------------------------------------------------
+# Module-level optimiser instance (shared across all EulerAgent instances)
+# ---------------------------------------------------------------------------
+
+_OPTIMIZER = TokenOptimizer()
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +76,10 @@ class AgentState(TypedDict, total=False):
     instruction_docs: str
     memory_context: str
     semantic_context: str
+
+    # optimisation metadata (set by _classify_query node)
+    complexity: str                   # QueryComplexity.value
+    selected_specialists: list[str]   # specialist keys to invoke
 
     # planner
     plan: str
@@ -118,6 +146,11 @@ def _build_base_context(state: AgentState) -> str:
     )
 
 
+def _workdir_fingerprint(workdir: str) -> str:
+    """Cheap hash of the workdir path used in cache keys."""
+    return hashlib.md5(workdir.encode()).hexdigest()[:8]
+
+
 # ---------------------------------------------------------------------------
 # Agent class
 # ---------------------------------------------------------------------------
@@ -125,11 +158,28 @@ def _build_base_context(state: AgentState) -> str:
 class EulerAgent:
     def __init__(self, provider: str, model_name: str, api_key: str) -> None:
         self.model = get_chat_model(provider=provider, model=model_name, api_key=api_key)
+        self._model_id = f"{provider}/{model_name}"
 
     def ask(self, prompt: str, role: str = "assistant") -> str:
         from euler_agent.core.prompts import PRODUCTION_PREAMBLE
         system = f"{PRODUCTION_PREAMBLE}\n\nYou are Euler acting as {role}."
         return _invoke(self.model, system, prompt)
+
+    # ------------------------------------------------------------------
+    # Optimisation node
+    # ------------------------------------------------------------------
+
+    def _classify_query(self, state: AgentState) -> AgentState:
+        """
+        Classify the user goal to determine pipeline complexity and the
+        minimal specialist set required.  Adds ``complexity`` and
+        ``selected_specialists`` to state for downstream nodes.
+        """
+        result: OptimizationResult = _OPTIMIZER.classify_query(state["user_goal"])
+        return {
+            "complexity": result.complexity.value,
+            "selected_specialists": result.selected_specialists,
+        }
 
     # ------------------------------------------------------------------
     # Graph nodes
@@ -138,21 +188,36 @@ class EulerAgent:
     def _gather_context(self, state: AgentState) -> AgentState:
         workdir = state["workdir"]
         goal = state["user_goal"]
+        complexity_str = state.get("complexity", QueryComplexity.FULL.value)
+        try:
+            complexity = QueryComplexity(complexity_str)
+        except ValueError:
+            complexity = QueryComplexity.FULL
 
-        memory_snippets = search_memory(project=workdir, query=goal, limit=4)
+        # --- memory (relevance-gated) ---
+        memory_scored = search_memory_scored(project=workdir, query=goal, limit=6)
+        filtered_memory = _OPTIMIZER.filter_memory_hits(memory_scored, complexity)
         memory_context = "\n\n".join(
-            f"Past goal: {m.goal}\nOutcome: {m.result[:600]}"
-            for m in memory_snippets
+            f"Past goal: {m.goal}\nOutcome: {m.result[:500]}"
+            for m in filtered_memory
         ) or "None"
 
-        semantic_hits = search_index(workdir=workdir, query=goal, limit=5)
+        # --- semantic index (relevance-gated) ---
+        semantic_scored = search_index_scored(workdir=workdir, query=goal, limit=10)
+        filtered_hits = _OPTIMIZER.filter_semantic_hits(semantic_scored, complexity)
         semantic_context = "\n\n".join(
             f"File: {h['path']} lines {h['start_line']}-{h['end_line']}\n"
-            f"{h.get('content', '')[:600]}"
-            for h in semantic_hits
+            f"{h.get('content', '')[:500]}"
+            for h in filtered_hits
         ) or "None"
 
-        instruction_docs = load_euler_instruction_docs(Path(workdir)) or "None"
+        # --- instruction docs ---
+        # For focused queries, truncate heavy instruction docs to save tokens.
+        raw_docs = load_euler_instruction_docs(Path(workdir)) or "None"
+        if complexity == QueryComplexity.FOCUSED and len(raw_docs) > 1_200:
+            instruction_docs = raw_docs[:1_200] + "\n... [truncated]"
+        else:
+            instruction_docs = raw_docs
 
         return {
             "memory_context": memory_context,
@@ -177,7 +242,8 @@ class EulerAgent:
     def _parallel_specialists(self, state: AgentState) -> AgentState:
         ctx = _build_base_context(state)
 
-        specialists: dict[str, tuple[str, str]] = {
+        # Full catalogue of available specialists
+        all_specialists: dict[str, tuple[str, str]] = {
             "architect":  (SYSTEM_ARCHITECT,  f"Produce the full architecture blueprint.\n\n{ctx}"),
             "coder":      (SYSTEM_CODER,       f"Produce the complete implementation.\n\n{ctx}"),
             "tester":     (SYSTEM_TESTER,      f"Produce the complete test suite.\n\n{ctx}"),
@@ -188,9 +254,17 @@ class EulerAgent:
             "refactor":   (SYSTEM_REFACTOR,    f"Identify and apply refactoring to any existing relevant code.\n\n{ctx}"),
         }
 
-        results: dict[str, str] = {}
+        # Restrict to the specialists selected by _classify_query
+        selected_keys: list[str] = state.get(
+            "selected_specialists",
+            list(all_specialists.keys()),  # fallback: all
+        )
+        specialists = {k: v for k, v in all_specialists.items() if k in selected_keys}
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        results: dict[str, str] = {}
+        workers = max(1, len(specialists))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             future_to_key = {
                 pool.submit(_invoke, self.model, sys_prompt, human_prompt): key
                 for key, (sys_prompt, human_prompt) in specialists.items()
@@ -202,6 +276,7 @@ class EulerAgent:
                 except Exception as exc:
                     results[key] = f"[specialist error: {exc}]"
 
+        # Populate all output keys (unselected specialists get empty string)
         return {
             "architect_output":  results.get("architect", ""),
             "coder_output":      results.get("coder", ""),
@@ -214,17 +289,18 @@ class EulerAgent:
         }
 
     def _arbitrator(self, state: AgentState) -> AgentState:
+        selected = state.get("selected_specialists", [
+            "architect", "coder", "tester", "security",
+            "devops", "db", "documenter", "refactor",
+        ])
+
+        # Use the optimiser to compress specialist outputs before aggregation
+        compressed_outputs = _OPTIMIZER.compress_specialist_outputs(state, selected)
+
         prompt = (
             f"## User Goal\n{state['user_goal']}\n\n"
             f"## Strategic Plan\n{state.get('plan', '')}\n\n"
-            f"---\n### Architect Output\n{state.get('architect_output', '')}\n\n"
-            f"---\n### Coder Output\n{state.get('coder_output', '')}\n\n"
-            f"---\n### Tester Output\n{state.get('tester_output', '')}\n\n"
-            f"---\n### Security Output\n{state.get('security_output', '')}\n\n"
-            f"---\n### DevOps Output\n{state.get('devops_output', '')}\n\n"
-            f"---\n### Database Output\n{state.get('db_output', '')}\n\n"
-            f"---\n### Documenter Output\n{state.get('documenter_output', '')}\n\n"
-            f"---\n### Refactor Output\n{state.get('refactor_output', '')}\n\n"
+            f"{compressed_outputs}\n\n"
             "Arbitrate all specialist outputs into a single unified strategy."
         )
         merged = _invoke(self.model, SYSTEM_ARBITRATOR, prompt)
@@ -247,18 +323,20 @@ class EulerAgent:
 
     def _build_graph(self):
         graph = StateGraph(AgentState)
-        graph.add_node("gather_context",      self._gather_context)
-        graph.add_node("planner",             self._planner)
+        graph.add_node("classify_query",       self._classify_query)
+        graph.add_node("gather_context",       self._gather_context)
+        graph.add_node("planner",              self._planner)
         graph.add_node("parallel_specialists", self._parallel_specialists)
-        graph.add_node("arbitrator",          self._arbitrator)
-        graph.add_node("reviewer",            self._reviewer)
+        graph.add_node("arbitrator",           self._arbitrator)
+        graph.add_node("reviewer",             self._reviewer)
 
-        graph.add_edge(START,                "gather_context")
-        graph.add_edge("gather_context",     "planner")
-        graph.add_edge("planner",            "parallel_specialists")
+        graph.add_edge(START,                  "classify_query")
+        graph.add_edge("classify_query",       "gather_context")
+        graph.add_edge("gather_context",       "planner")
+        graph.add_edge("planner",              "parallel_specialists")
         graph.add_edge("parallel_specialists", "arbitrator")
-        graph.add_edge("arbitrator",         "reviewer")
-        graph.add_edge("reviewer",           END)
+        graph.add_edge("arbitrator",           "reviewer")
+        graph.add_edge("reviewer",             END)
         return graph.compile()
 
     # ------------------------------------------------------------------
@@ -266,8 +344,20 @@ class EulerAgent:
     # ------------------------------------------------------------------
 
     def run(self, user_goal: str, workdir: str | None = None) -> str:
-        compiled = self._build_graph()
         resolved_workdir = str(Path(workdir or ".").resolve())
+
+        # --- response cache check (fast path) ---
+        cache_key = _OPTIMIZER.make_cache_key(
+            self._model_id,
+            user_goal,
+            _workdir_fingerprint(resolved_workdir),
+        )
+        cached = _OPTIMIZER.get_cached_response(cache_key)
+        if cached is not None:
+            return cached
+
+        # --- full pipeline ---
+        compiled = self._build_graph()
         initial: AgentState = {
             "user_goal": user_goal,
             "workdir": resolved_workdir,
@@ -297,7 +387,11 @@ class EulerAgent:
                     f"Original error: {msg[:400]}"
                 ) from exc
             raise
+
         final = result.get("final_output", "No output generated.")
+
+        # Persist to response cache and long-term memory
+        _OPTIMIZER.set_cached_response(cache_key, final)
         add_memory(
             project=resolved_workdir,
             goal=user_goal,

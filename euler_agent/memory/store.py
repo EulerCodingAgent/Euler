@@ -79,6 +79,26 @@ def search_memory(project: str, query: str, limit: int = 3) -> list[MemoryEntry]
     Handles legacy entries that stored dense float embeddings by re-embedding
     them on the fly using the current TF-IDF engine.
     """
+    return [entry for _, entry in search_memory_scored(project, query, limit)]
+
+
+def search_memory_scored(
+    project: str,
+    query: str,
+    limit: int = 4,
+) -> list[tuple[float, MemoryEntry]]:
+    """
+    Like :func:`search_memory` but returns ``(score, entry)`` pairs so callers
+    can apply a relevance threshold before injecting memory into prompts.
+
+    Args:
+        project: Absolute path of the project directory (used as a namespace).
+        query:   The current user goal to match against.
+        limit:   Maximum results to return before threshold filtering.
+
+    Returns:
+        List of ``(cosine_similarity, MemoryEntry)`` sorted descending by score.
+    """
     rows = _load_raw()
     if not rows:
         return []
@@ -101,4 +121,4 @@ def search_memory(project: str, query: str, limit: int = 3) -> list[MemoryEntry]
             candidates.append((score, row))
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    return [MemoryEntry(**row) for _, row in candidates[:limit]]
+    return [(score, MemoryEntry(**row)) for score, row in candidates[:limit]]

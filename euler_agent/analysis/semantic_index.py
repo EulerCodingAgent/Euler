@@ -167,6 +167,27 @@ def search_index(workdir: str, query: str, limit: int = 5) -> list[dict]:
 
     Returns an empty list if no index has been built yet.
     """
+    return [chunk for _, chunk in search_index_scored(workdir, query, limit)]
+
+
+def search_index_scored(
+    workdir: str,
+    query: str,
+    limit: int = 8,
+) -> list[tuple[float, dict]]:
+    """
+    Like :func:`search_index` but returns ``(score, chunk)`` pairs so that
+    callers can apply their own relevance threshold.
+
+    Args:
+        workdir: Root of the repository whose index should be searched.
+        query:   Free-form search query (natural language or code snippet).
+        limit:   Maximum number of results to return before threshold filtering.
+
+    Returns:
+        List of ``(cosine_similarity, chunk_dict)`` sorted descending by score.
+        Empty list when no index exists.
+    """
     root = Path(workdir).resolve()
     index_file = root / ".euler" / "semantic_index.json"
     if not index_file.exists():
@@ -192,4 +213,4 @@ def search_index(workdir: str, query: str, limit: int = 5) -> list[dict]:
             scored.append((score, chunk))
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    return [chunk for _, chunk in scored[:limit]]
+    return scored[:limit]

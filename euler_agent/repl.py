@@ -6,6 +6,7 @@ import difflib
 import re
 from ast import parse as ast_parse
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.markup import escape
@@ -533,6 +534,8 @@ if _PT_AVAILABLE:
                     "/search",
                     "/graph",
                     "/knowledge-graph",
+                    "/pick",
+                    "/strict-patch",
                     "/delete",
                     "/exit",
                     "/quit",
@@ -624,7 +627,15 @@ if _PT_AVAILABLE:
 
 def run_repl(agent: EulerAgent) -> None:
     console = Console()
-    mode_state = {"agent_mode": "basic"}
+    mode_state: dict[str, Any] = {
+        "agent_mode": "basic",
+        "strict_patch_mode": True,
+        "pending_refs": [],
+        "runs": 0,
+        "cache_hits": 0,
+        "last_metrics": {},
+        "last_metrics_seq": 0,
+    }
     console.print(
         "[bold cyan]Euler REPL[/bold cyan] — type [bold]/help[/bold] for commands, "
         "[bold]@[/bold] to reference files/folders "
@@ -635,6 +646,7 @@ def run_repl(agent: EulerAgent) -> None:
 
     while True:
         try:
+            console.print(_render_run_metrics_header(mode_state))
             if session is not None:
                 user_input = session.prompt("euler> ").strip()
             else:
@@ -647,7 +659,12 @@ def run_repl(agent: EulerAgent) -> None:
             continue
 
         try:
+            pending_refs = mode_state.get("pending_refs", [])
+            if pending_refs and not user_input.startswith("/"):
+                user_input = " ".join(pending_refs) + " " + user_input
+                mode_state["pending_refs"] = []
             _handle_input(console, agent, user_input, mode_state)
+            _record_agent_metrics(agent, mode_state)
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]bye[/yellow]")
             break
@@ -685,6 +702,8 @@ def _handle_input(
             "  /search <query>                  — semantic code search\n"
             "  /graph                           — build cross-language code graph\n"
             "  /knowledge-graph [folder]        — save graph to ./Euler/knowledge_graph*.json\n"
+            "  /pick <query>                    — fuzzy-select files and queue @refs\n"
+            "  /strict-patch on|off             — enforce unified diff in patch mode\n"
             "  @file.ext                        — attach full file to your prompt\n"
             "  @file.ext:start-end              — attach a line range to your prompt\n"
             "  @folder/                         — attach all code files in a folder\n"
@@ -709,6 +728,23 @@ def _handle_input(
     if user_input == "/agent":
         current = mode_state.get("agent_mode", "basic")
         console.print(f"[cyan]Current agent mode:[/cyan] [bold]{escape(current)}[/bold]")
+        return
+
+    if user_input.startswith("/strict-patch "):
+        val = user_input.removeprefix("/strict-patch ").strip().lower()
+        if val not in {"on", "off"}:
+            console.print("[yellow]usage: /strict-patch on|off[/yellow]")
+            return
+        mode_state["strict_patch_mode"] = (val == "on")
+        console.print(
+            "[green]Strict patch mode:[/green] "
+            + ("[bold]ON[/bold]" if mode_state["strict_patch_mode"] else "[bold]OFF[/bold]")
+        )
+        return
+
+    if user_input.startswith("/pick "):
+        query = user_input.removeprefix("/pick ").strip()
+        _fuzzy_file_pick(console, Path.cwd(), query, mode_state)
         return
 
     if user_input in {"/agent modes", "/agent list"}:
@@ -923,7 +959,7 @@ def _handle_input(
         return
 
     # ── free-form prompt ──────────────────────────────────────────────────────
-    _handle_freeform(console, agent, user_input, mode_state.get("agent_mode", "basic"))
+    _handle_freeform(console, agent, user_input, mode_state.get("agent_mode", "basic"), mode_state)
 
 
 def _handle_delete_command(console: Console, raw_paths: list[str]) -> None:
@@ -1018,6 +1054,42 @@ def _print_modes_overview(console: Console) -> None:
     )
 
 
+def _render_run_metrics_header(ui_state: dict[str, Any]) -> str:
+    runs = int(ui_state.get("runs", 0))
+    cache_hits = int(ui_state.get("cache_hits", 0))
+    last = ui_state.get("last_metrics", {}) or {}
+    cache_hit_pct = (cache_hits * 100.0 / runs) if runs else 0.0
+    stage_tokens = last.get("stage_tokens", {}) or {}
+    total_tokens = sum(int(v) for v in stage_tokens.values())
+    specialists_used = int(last.get("specialists_used", 0))
+    specialists_total = int(last.get("specialists_total", 8))
+    util_pct = (specialists_used * 100.0 / specialists_total) if specialists_total else 0.0
+    if stage_tokens:
+        top = sorted(stage_tokens.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        stage_summary = ", ".join(f"{k}:{int(v)}t" for k, v in top)
+    else:
+        stage_summary = "n/a"
+    return (
+        f"[dim]RunMetrics | tokens:{total_tokens} | cache-hit:{cache_hit_pct:.1f}% "
+        f"| specialists:{specialists_used}/{specialists_total} ({util_pct:.0f}%) "
+        f"| stage-cost:{stage_summary}[/dim]"
+    )
+
+
+def _record_agent_metrics(agent: EulerAgent, ui_state: dict[str, Any]) -> None:
+    metrics = agent.get_last_run_stats()
+    if not metrics:
+        return
+    seq = int(metrics.get("seq", 0))
+    if seq <= int(ui_state.get("last_metrics_seq", 0)):
+        return
+    ui_state["runs"] = int(ui_state.get("runs", 0)) + 1
+    if metrics.get("cache_hit"):
+        ui_state["cache_hits"] = int(ui_state.get("cache_hits", 0)) + 1
+    ui_state["last_metrics"] = metrics
+    ui_state["last_metrics_seq"] = seq
+
+
 def _safe_graph_filename_for_target(cwd: Path, target_root: Path) -> str:
     if target_root.resolve() == cwd.resolve():
         return "knowledge_graph.json"
@@ -1033,6 +1105,7 @@ def _handle_freeform(
     agent: EulerAgent,
     user_input: str,
     agent_mode: str = "basic",
+    ui_state: dict[str, Any] | None = None,
 ) -> None:
     """Route free-form prompts, inject file content, call agent, apply patches."""
     expanded_input, notes, ref_paths = _expand_file_references(user_input)
@@ -1051,6 +1124,7 @@ def _handle_freeform(
     has_file_refs = bool(ref_paths)
     workdir = Path.cwd()
     mode_prompt = _mode_prefixed_prompt(mode, expanded_input)
+    strict_patch_mode = bool((ui_state or {}).get("strict_patch_mode", False))
 
     # ── forced mode: assistant single-call ────────────────────────────────────
     if mode == "assistant":
@@ -1085,6 +1159,13 @@ def _handle_freeform(
     # ── forced mode: patch-oriented single-call ────────────────────────────────
     if mode == "patch":
         prompt = mode_prompt + (_build_patch_hint(ref_paths) if has_file_refs else "")
+        if strict_patch_mode:
+            prompt += (
+                "\n\nSTRICT PATCH MODE:\n"
+                "You MUST include a unified diff block with headers (---, +++, @@).\n"
+                "Also include complete updated files as fenced code blocks for apply flow.\n"
+                "Reject free-form prose."
+            )
         try:
             with console.status(
                 "[bold cyan]Thinking and writing patches...[/bold cyan]",
@@ -1094,6 +1175,14 @@ def _handle_freeform(
         except Exception as exc:
             _print_error(console, exc)
             return
+        if strict_patch_mode:
+            has_unified_diff = ("--- " in output and "+++ " in output and "@@" in output)
+            if not has_unified_diff:
+                console.print(
+                    "[red]Strict patch mode rejected response:[/red] "
+                    "missing unified diff markers (---, +++, @@)."
+                )
+                return
         _print_output(console, output)
         _apply_and_report(console, output, workdir, ref_paths if has_file_refs else set())
         return
@@ -1166,6 +1255,74 @@ def _build_patch_hint(ref_paths: set[Path]) -> str:
         f"<complete new file content here>\n"
         f"```\n"
         f"Do not truncate. Output the entire file, not just the changed section."
+    )
+
+
+def _iter_candidate_files(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel_parts = path.relative_to(root).parts
+        if any(part in _SKIP_DIRS or part.startswith(".") for part in rel_parts):
+            continue
+        if path.suffix.lower() in _CODE_EXTENSIONS:
+            out.append(path)
+    return out
+
+
+def _fuzzy_file_pick(console: Console, root: Path, query: str, ui_state: dict[str, Any]) -> None:
+    q = query.strip().lower()
+    if not q:
+        console.print("[yellow]usage: /pick <file-or-fragment>[/yellow]")
+        return
+    files = _iter_candidate_files(root)
+    scored: list[tuple[int, Path]] = []
+    for path in files:
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        name = path.name.lower()
+        rel_lower = rel.lower()
+        score = 0
+        if rel_lower.startswith(q):
+            score += 50
+        if q in name:
+            score += 30
+        if q in rel_lower:
+            score += 10
+        if score > 0:
+            scored.append((score, path))
+    if not scored:
+        console.print("[yellow]No matching files found.[/yellow]")
+        return
+    scored.sort(key=lambda item: (-item[0], str(item[1])))
+    top = scored[:20]
+    console.print("[bold]Pick files[/bold] (comma list, e.g. 1,3,5; or 'a' for all):")
+    for idx, (_, path) in enumerate(top, 1):
+        rel = str(path.relative_to(root)).replace("\\", "/")
+        console.print(f"  {idx:>2}. {escape(rel)}")
+    choice = console.input("Select: ").strip().lower()
+    chosen: list[Path] = []
+    if choice == "a":
+        chosen = [p for _, p in top]
+    else:
+        indexes: list[int] = []
+        for part in choice.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part.isdigit():
+                indexes.append(int(part))
+        for i in indexes:
+            if 1 <= i <= len(top):
+                chosen.append(top[i - 1][1])
+    if not chosen:
+        console.print("[yellow]No files selected.[/yellow]")
+        return
+    refs = [f"@{str(p.relative_to(root)).replace('\\', '/')}" for p in chosen]
+    ui_state["pending_refs"] = refs
+    console.print(
+        "[green]Selected refs queued for next prompt:[/green] "
+        + " ".join(escape(r) for r in refs)
     )
 
 

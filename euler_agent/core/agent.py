@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -84,6 +84,7 @@ class AgentState(TypedDict, total=False):
     planner_confidence: float
     skip_specialists: bool
     skip_reason: str
+    stage_tokens: dict[str, int]
 
     # planner
     plan: str
@@ -170,10 +171,38 @@ class EulerAgent:
     def __init__(self, provider: str, model_name: str, api_key: str) -> None:
         self.model = get_chat_model(provider=provider, model=model_name, api_key=api_key)
         self._model_id = f"{provider}/{model_name}"
+        self._last_run_stats: dict[str, Any] = {}
+        self._stats_seq = 0
+
+    def _record_stage_tokens(
+        self,
+        state: AgentState,
+        stage: str,
+        system_prompt: str,
+        human_prompt: str,
+    ) -> None:
+        total = _OPTIMIZER.estimate_prompt_tokens(system_prompt, human_prompt)
+        stage_tokens = dict(state.get("stage_tokens", {}))
+        stage_tokens[stage] = stage_tokens.get(stage, 0) + total
+        state["stage_tokens"] = stage_tokens
+
+    def get_last_run_stats(self) -> dict[str, Any]:
+        return dict(self._last_run_stats)
 
     def ask(self, prompt: str, role: str = "assistant") -> str:
         from euler_agent.core.prompts import PRODUCTION_PREAMBLE
         system = f"{PRODUCTION_PREAMBLE}\n\nYou are Euler acting as {role}."
+        self._last_run_stats = {
+            "seq": self._stats_seq + 1,
+            "kind": "ask",
+            "cache_hit": False,
+            "specialists_used": 0,
+            "specialists_total": 8,
+            "stage_tokens": {
+                "ask": _OPTIMIZER.estimate_prompt_tokens(system, prompt),
+            },
+        }
+        self._stats_seq += 1
         return _invoke(self.model, system, prompt)
 
     # ------------------------------------------------------------------
@@ -267,6 +296,7 @@ class EulerAgent:
             f"{state.get('instruction_docs', 'None')}\n\n"
             "Produce the full strategic plan in the format described in your role."
         )
+        self._record_stage_tokens(state, "planner", SYSTEM_PLANNER, prompt)
         plan = _invoke(self.model, SYSTEM_PLANNER, prompt)
         complexity_str = state.get("complexity", QueryComplexity.FULL.value)
         try:
@@ -311,6 +341,8 @@ class EulerAgent:
             list(all_specialists.keys()),  # fallback: all
         )
         specialists = {k: v for k, v in all_specialists.items() if k in selected_keys}
+        for key, (sys_prompt, human_prompt) in specialists.items():
+            self._record_stage_tokens(state, f"specialist:{key}", sys_prompt, human_prompt)
 
         results: dict[str, str] = {}
         workers = max(1, len(specialists))
@@ -354,6 +386,7 @@ class EulerAgent:
             f"{compressed_outputs}\n\n"
             "Arbitrate all specialist outputs into a single unified strategy."
         )
+        self._record_stage_tokens(state, "arbitrator", SYSTEM_ARBITRATOR, prompt)
         merged = _invoke(self.model, SYSTEM_ARBITRATOR, prompt)
         return {"arbitrated_output": merged}
 
@@ -374,6 +407,7 @@ class EulerAgent:
             "Perform the final production review and deliver the complete, "
             "corrected, and deployment-ready answer."
         )
+        self._record_stage_tokens(state, "reviewer", SYSTEM_REVIEWER, prompt)
         final = _invoke(self.model, SYSTEM_REVIEWER, prompt)
         return {"final_output": final}
 
@@ -412,6 +446,8 @@ class EulerAgent:
 
     def run(self, user_goal: str, workdir: str | None = None) -> str:
         resolved_workdir = str(Path(workdir or ".").resolve())
+        stage_tokens: dict[str, int] = {}
+        cache_hit = False
 
         # --- response cache check (fast path) ---
         cache_key = _OPTIMIZER.make_cache_key(
@@ -421,6 +457,16 @@ class EulerAgent:
         )
         cached = _OPTIMIZER.get_cached_response(cache_key)
         if cached is not None:
+            cache_hit = True
+            self._last_run_stats = {
+                "seq": self._stats_seq + 1,
+                "kind": "run",
+                "cache_hit": True,
+                "specialists_used": 0,
+                "specialists_total": 8,
+                "stage_tokens": {},
+            }
+            self._stats_seq += 1
             return cached
         semantic_cached = _OPTIMIZER.get_semantic_cached_response(
             self._model_id,
@@ -428,6 +474,16 @@ class EulerAgent:
             _workdir_fingerprint(resolved_workdir),
         )
         if semantic_cached is not None:
+            cache_hit = True
+            self._last_run_stats = {
+                "seq": self._stats_seq + 1,
+                "kind": "run",
+                "cache_hit": True,
+                "specialists_used": 0,
+                "specialists_total": 8,
+                "stage_tokens": {},
+            }
+            self._stats_seq += 1
             return semantic_cached
 
         # --- full pipeline ---
@@ -435,6 +491,7 @@ class EulerAgent:
         initial: AgentState = {
             "user_goal": user_goal,
             "workdir": resolved_workdir,
+            "stage_tokens": {},
         }
         try:
             result = compiled.invoke(initial)
@@ -463,6 +520,17 @@ class EulerAgent:
             raise
 
         final = result.get("final_output", "No output generated.")
+        stage_tokens = result.get("stage_tokens", {}) or {}
+        selected = result.get("selected_specialists", []) or []
+        self._last_run_stats = {
+            "seq": self._stats_seq + 1,
+            "kind": "run",
+            "cache_hit": cache_hit,
+            "specialists_used": len(selected),
+            "specialists_total": 8,
+            "stage_tokens": stage_tokens,
+        }
+        self._stats_seq += 1
 
         # Persist to response cache and long-term memory
         _OPTIMIZER.set_semantic_cached_response(

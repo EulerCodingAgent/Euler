@@ -52,6 +52,7 @@ from euler_agent.core.prompts import (
 )
 from euler_agent.core.providers import get_chat_model
 from euler_agent.analysis.semantic_index import search_index_scored
+from euler_agent.analysis.code_graph import load_code_graph, related_files_from_graph
 from euler_agent.optimization.token_optimizer import (
     QueryComplexity,
     TokenOptimizer,
@@ -80,6 +81,9 @@ class AgentState(TypedDict, total=False):
     # optimisation metadata (set by _classify_query node)
     complexity: str                   # QueryComplexity.value
     selected_specialists: list[str]   # specialist keys to invoke
+    planner_confidence: float
+    skip_specialists: bool
+    skip_reason: str
 
     # planner
     plan: str
@@ -146,6 +150,13 @@ def _build_base_context(state: AgentState) -> str:
     )
 
 
+def _compress_text_block(text: str, cap: int = 1800) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= cap:
+        return compact
+    return compact[:cap] + "... [truncated]"
+
+
 def _workdir_fingerprint(workdir: str) -> str:
     """Cheap hash of the workdir path used in cache keys."""
     return hashlib.md5(workdir.encode()).hexdigest()[:8]
@@ -198,17 +209,37 @@ class EulerAgent:
         memory_scored = search_memory_scored(project=workdir, query=goal, limit=6)
         filtered_memory = _OPTIMIZER.filter_memory_hits(memory_scored, complexity)
         memory_context = "\n\n".join(
-            f"Past goal: {m.goal}\nOutcome: {m.result[:500]}"
+            f"Past goal: {m.goal}\nLesson: {_compress_text_block(getattr(m, 'lesson_card', m.result), 550)}"
             for m in filtered_memory
         ) or "None"
 
         # --- semantic index (relevance-gated) ---
-        semantic_scored = search_index_scored(workdir=workdir, query=goal, limit=10)
+        semantic_scored = search_index_scored(workdir=workdir, query=goal, limit=30)
         filtered_hits = _OPTIMIZER.filter_semantic_hits(semantic_scored, complexity)
+        top_seed_files = [h.get("path", "") for h in filtered_hits if h.get("path")]
+
+        # Optional graph-aware expansion for tighter, high-precision context.
+        graph_payload = load_code_graph(workdir)
+        extra_related_files: list[str] = []
+        if graph_payload and top_seed_files:
+            extra_related_files = related_files_from_graph(graph_payload, top_seed_files, limit=3)
+
+        existing_paths = {h.get("path", "") for h in filtered_hits}
+        graph_augmented_hits = filtered_hits[:]
+        for score, hit in semantic_scored:
+            if score < _OPTIMIZER.relevance_threshold:
+                continue
+            path = hit.get("path", "")
+            if path in extra_related_files and path not in existing_paths:
+                graph_augmented_hits.append(hit)
+                existing_paths.add(path)
+            if len(graph_augmented_hits) >= (len(filtered_hits) + 3):
+                break
+
         semantic_context = "\n\n".join(
             f"File: {h['path']} lines {h['start_line']}-{h['end_line']}\n"
             f"{h.get('content', '')[:500]}"
-            for h in filtered_hits
+            for h in graph_augmented_hits
         ) or "None"
 
         # --- instruction docs ---
@@ -237,7 +268,27 @@ class EulerAgent:
             "Produce the full strategic plan in the format described in your role."
         )
         plan = _invoke(self.model, SYSTEM_PLANNER, prompt)
-        return {"plan": plan}
+        complexity_str = state.get("complexity", QueryComplexity.FULL.value)
+        try:
+            complexity = QueryComplexity(complexity_str)
+        except ValueError:
+            complexity = QueryComplexity.FULL
+        skip, confidence, reason = _OPTIMIZER.should_skip_specialists(
+            state["user_goal"],
+            complexity,
+            plan,
+        )
+        return {
+            "plan": plan,
+            "skip_specialists": skip,
+            "planner_confidence": confidence,
+            "skip_reason": reason,
+        }
+
+    def _route_after_planner(self, state: AgentState) -> str:
+        if state.get("skip_specialists", False):
+            return "reviewer"
+        return "parallel_specialists"
 
     def _parallel_specialists(self, state: AgentState) -> AgentState:
         ctx = _build_base_context(state)
@@ -307,9 +358,18 @@ class EulerAgent:
         return {"arbitrated_output": merged}
 
     def _reviewer(self, state: AgentState) -> AgentState:
+        skip_note = ""
+        if state.get("skip_specialists", False):
+            skip_note = (
+                "## Specialist Stage\n"
+                "Skipped by adaptive early-exit optimization.\n"
+                f"Reason: {state.get('skip_reason', '')}\n"
+                f"Planner confidence: {state.get('planner_confidence', 0.0):.2f}\n\n"
+            )
         prompt = (
             f"## User Goal\n{state['user_goal']}\n\n"
             f"## Strategic Plan\n{state.get('plan', '')}\n\n"
+            f"{skip_note}"
             f"## Arbitrated Strategy\n{state.get('arbitrated_output', '')}\n\n"
             "Perform the final production review and deliver the complete, "
             "corrected, and deployment-ready answer."
@@ -333,7 +393,14 @@ class EulerAgent:
         graph.add_edge(START,                  "classify_query")
         graph.add_edge("classify_query",       "gather_context")
         graph.add_edge("gather_context",       "planner")
-        graph.add_edge("planner",              "parallel_specialists")
+        graph.add_conditional_edges(
+            "planner",
+            self._route_after_planner,
+            {
+                "parallel_specialists": "parallel_specialists",
+                "reviewer": "reviewer",
+            },
+        )
         graph.add_edge("parallel_specialists", "arbitrator")
         graph.add_edge("arbitrator",           "reviewer")
         graph.add_edge("reviewer",             END)
@@ -355,6 +422,13 @@ class EulerAgent:
         cached = _OPTIMIZER.get_cached_response(cache_key)
         if cached is not None:
             return cached
+        semantic_cached = _OPTIMIZER.get_semantic_cached_response(
+            self._model_id,
+            user_goal,
+            _workdir_fingerprint(resolved_workdir),
+        )
+        if semantic_cached is not None:
+            return semantic_cached
 
         # --- full pipeline ---
         compiled = self._build_graph()
@@ -391,7 +465,13 @@ class EulerAgent:
         final = result.get("final_output", "No output generated.")
 
         # Persist to response cache and long-term memory
-        _OPTIMIZER.set_cached_response(cache_key, final)
+        _OPTIMIZER.set_semantic_cached_response(
+            cache_key=cache_key,
+            response=final,
+            model_id=self._model_id,
+            query=user_goal,
+            context_fingerprint=_workdir_fingerprint(resolved_workdir),
+        )
         add_memory(
             project=resolved_workdir,
             goal=user_goal,

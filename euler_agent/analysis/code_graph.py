@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -148,3 +149,66 @@ def build_code_graph(workdir: str, output_path: str | None = None) -> str:
     }
     graph_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return f"Graph saved to {graph_file} ({len(unique_nodes)} nodes, {len(unique_edges)} edges)"
+
+
+def load_code_graph(workdir: str) -> dict | None:
+    """
+    Load an existing graph payload from .euler/code_graph.json.
+    """
+    root = Path(workdir).resolve()
+    graph_file = root / ".euler" / "code_graph.json"
+    if not graph_file.exists():
+        return None
+    try:
+        return json.loads(graph_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def related_files_from_graph(
+    graph_payload: dict,
+    seed_files: list[str],
+    limit: int = 4,
+) -> list[str]:
+    """
+    Return files related to *seed_files* by shared graph targets.
+
+    Heuristic: files are related when they connect to the same imported module,
+    symbol, or table nodes.
+    """
+    nodes = graph_payload.get("nodes", [])
+    edges = graph_payload.get("edges", [])
+    if not nodes or not edges or not seed_files:
+        return []
+
+    node_to_file: dict[str, str] = {}
+    for node in nodes:
+        node_id = str(node.get("id", ""))
+        node_file = str(node.get("file", ""))
+        if node_id and node_file:
+            node_to_file[node_id] = node_file
+
+    file_targets: dict[str, set[str]] = defaultdict(set)
+    target_to_files: dict[str, set[str]] = defaultdict(set)
+    for edge in edges:
+        source = str(edge.get("source", ""))
+        target = str(edge.get("target", ""))
+        source_file = node_to_file.get(source)
+        if not source_file or not target:
+            continue
+        file_targets[source_file].add(target)
+        target_to_files[target].add(source_file)
+
+    seed_set = set(seed_files)
+    seed_targets: set[str] = set()
+    for seed in seed_set:
+        seed_targets.update(file_targets.get(seed, set()))
+
+    scores: dict[str, int] = defaultdict(int)
+    for target in seed_targets:
+        for fpath in target_to_files.get(target, set()):
+            if fpath not in seed_set:
+                scores[fpath] += 1
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [path for path, _ in ranked[:limit]]

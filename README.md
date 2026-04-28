@@ -50,6 +50,8 @@ Euler index
 Euler index --full
 Euler search-code "where is auth token validation implemented"
 Euler graph
+Euler knowledge-graph
+Euler knowledge-graph src/
 ```
 
 ## Features in this version
@@ -69,11 +71,17 @@ Euler graph
 - Multi-agent orchestration with specialist roles (planner -> architect/coder/tester in parallel -> arbitrator -> reviewer)
 - Support for project instruction memory in `./Euler/*.md`
 - Persistent long-term memory for previous project goals/results (`Euler memory "<query>"`)
-- Embedding-backed semantic memory retrieval (local vector search via FastEmbed)
+- Embedding-backed semantic memory retrieval (local sparse TF-IDF; zero native deps)
 - AST-aware patch safety guards for Python edits in autonomous mode
 - Repo semantic indexing for codebase-wide natural language retrieval (`Euler index`, `Euler search-code`)
 - Incremental semantic index updates with optional full rebuild (`Euler index`, `Euler index --full`)
 - Cross-language graph extraction for Python + TS/JS + SQL symbols/relations (`Euler graph`)
+- Knowledge-graph build to `./Euler/knowledge_graph*.json` for root or selected folder (`Euler knowledge-graph [folder]`, REPL `/knowledge-graph [folder]`)
+- Graph-aware retrieval expansion (uses `code_graph.json` neighbors to improve context precision)
+- Semantic response cache with approximate query matching for near-identical prompts
+- Memory lesson cards (compact summaries) to reduce noisy long-history prompt injection
+- Adaptive specialist early-exit for low-risk focused tasks
+- Prompt-delta autopilot context to limit multi-round context bloat
 - Transactional round snapshots with rollback on command/verification failure in autopilot
 - Policy profiles (`safe`, `normal`, `aggressive`) for autopilot guardrails
 - Approval-gated risky commands/actions with explicit auto-approve flag

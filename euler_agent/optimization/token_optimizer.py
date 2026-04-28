@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from euler_agent.analysis.tfidf import cosine_sparse, embed
+
 
 # ---------------------------------------------------------------------------
 # Configuration constants (all overridable via TokenOptimizer constructor)
@@ -356,6 +358,50 @@ class TokenOptimizer:
             return None
         return entry.get("response")
 
+    def get_semantic_cached_response(
+        self,
+        model_id: str,
+        query: str,
+        context_fingerprint: str = "",
+        min_similarity: float = 0.93,
+    ) -> str | None:
+        """
+        Return a semantically similar cached response if available.
+
+        Uses sparse TF cosine similarity over cached query embeddings. Only cache
+        entries from the same model and context fingerprint are considered.
+        """
+        if not self.cache_file.exists():
+            return None
+        try:
+            store: dict = json.loads(self.cache_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        now = time.time()
+        query_vec = embed(query)
+        best_sim = 0.0
+        best_resp: str | None = None
+        for entry in store.values():
+            if not isinstance(entry, dict):
+                continue
+            if now - entry.get("ts", 0) > self.cache_ttl:
+                continue
+            if entry.get("model_id") != model_id:
+                continue
+            if entry.get("context_fingerprint", "") != context_fingerprint:
+                continue
+            emb = entry.get("query_embedding")
+            if not isinstance(emb, dict):
+                continue
+            sim = cosine_sparse(query_vec, emb)
+            if sim >= min_similarity and sim > best_sim:
+                response = entry.get("response")
+                if isinstance(response, str):
+                    best_sim = sim
+                    best_resp = response
+        return best_resp
+
     def set_cached_response(self, cache_key: str, response: str) -> None:
         """Persist *response* to the cache under *cache_key*."""
         store: dict = {}
@@ -368,6 +414,41 @@ class TokenOptimizer:
         store[cache_key] = {"response": response, "ts": time.time()}
 
         # LRU eviction: keep only the most recent _CACHE_MAX_ENTRIES entries
+        if len(store) > _CACHE_MAX_ENTRIES:
+            sorted_keys = sorted(store, key=lambda k: store[k].get("ts", 0))
+            for old_key in sorted_keys[: len(store) - _CACHE_MAX_ENTRIES]:
+                del store[old_key]
+
+        self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+        self.cache_file.write_text(json.dumps(store, indent=2), encoding="utf-8")
+
+    def set_semantic_cached_response(
+        self,
+        cache_key: str,
+        response: str,
+        model_id: str,
+        query: str,
+        context_fingerprint: str = "",
+    ) -> None:
+        """
+        Persist a cache entry with semantic metadata for approximate matching.
+        """
+        store: dict = {}
+        if self.cache_file.exists():
+            try:
+                store = json.loads(self.cache_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                store = {}
+
+        store[cache_key] = {
+            "response": response,
+            "ts": time.time(),
+            "model_id": model_id,
+            "context_fingerprint": context_fingerprint,
+            "query": query,
+            "query_embedding": embed(query),
+        }
+
         if len(store) > _CACHE_MAX_ENTRIES:
             sorted_keys = sorted(store, key=lambda k: store[k].get("ts", 0))
             for old_key in sorted_keys[: len(store) - _CACHE_MAX_ENTRIES]:
@@ -399,3 +480,40 @@ class TokenOptimizer:
     ) -> int:
         """Estimate total tokens for a single (system, human) prompt pair."""
         return estimate_tokens(system_prompt) + estimate_tokens(human_prompt)
+
+    # ------------------------------------------------------------------ #
+    # 6. Adaptive specialist stopping                                     #
+    # ------------------------------------------------------------------ #
+
+    def should_skip_specialists(
+        self,
+        query: str,
+        complexity: QueryComplexity,
+        planner_output: str,
+    ) -> tuple[bool, float, str]:
+        """
+        Decide if specialists can be skipped safely for low-risk focused tasks.
+
+        Returns:
+            (skip, confidence_0_to_1, reason)
+        """
+        if complexity != QueryComplexity.FOCUSED:
+            return False, 0.35, "non-focused query"
+
+        lower = query.lower()
+        high_risk_signals = (
+            "security", "auth", "password", "token", "sql", "database",
+            "migration", "deploy", "docker", "kubernetes", "payment",
+            "encrypt", "compliance", "permission",
+        )
+        if any(sig in lower for sig in high_risk_signals):
+            return False, 0.45, "high-risk domain keywords detected"
+
+        has_structured_plan = "## " in planner_output or "1." in planner_output
+        confidence = 0.9 if has_structured_plan else 0.82
+        if len(planner_output.strip()) < 180:
+            confidence -= 0.08
+
+        skip = confidence >= 0.85
+        reason = "focused low-risk task with high planner confidence" if skip else "planner confidence too low"
+        return skip, max(0.0, min(1.0, confidence)), reason

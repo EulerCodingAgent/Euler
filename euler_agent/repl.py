@@ -12,6 +12,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 
+from euler_agent.agent_modes import MODE_BY_NAME, MODE_SPECS
 from euler_agent.core.agent import EulerAgent
 from euler_agent.core.autopilot import run_autopilot
 from euler_agent.analysis.code_graph import build_code_graph
@@ -89,6 +90,11 @@ _QUESTION_FIRST_WORDS = frozenset({
     "tell", "show", "is", "are", "does", "can", "could",
     "should", "would", "hi", "hello", "hey",
 })
+
+_AGENT_MODES: tuple[str, ...] = tuple(spec.name for spec in MODE_SPECS)
+_SPECIALIST_MODES: frozenset[str] = frozenset(
+    spec.name for spec in MODE_SPECS if spec.specialist_role is not None
+)
 
 
 # ── patch extraction & approval ────────────────────────────────────────────────
@@ -499,16 +505,50 @@ def _print_error(console: Console, exc: Exception) -> None:
 
 if _PT_AVAILABLE:
     class _AtCompleter(Completer):
-        """Complete @path references as the user types them.
+        """Complete slash commands and @path references as the user types.
 
-        Triggers whenever the cursor is inside a ``@…`` token.
-        Shows matching files and folders from cwd, with subdirectory
-        drilling (e.g. ``@euler_agent/c`` shows files starting with "c"
-        inside the euler_agent/ folder).
+        - ``/``: show all commands, then filter as user types.
+        - ``@``: complete file/folder references with subdirectory drilling.
         """
 
         def get_completions(self, document, complete_event):
             text = document.text_before_cursor
+            stripped = text.lstrip()
+
+            # Slash-command completion on first token.
+            if stripped.startswith("/") and " " not in stripped:
+                base_commands = [
+                    "/help",
+                    "/agent",
+                    "/agent modes",
+                    "/agent show",
+                    "/agent set",
+                    "/sql",
+                    "/replace",
+                    "/convert",
+                    "/convert-code",
+                    "/auto",
+                    "/memory",
+                    "/index",
+                    "/search",
+                    "/graph",
+                    "/knowledge-graph",
+                    "/delete",
+                    "/exit",
+                    "/quit",
+                ]
+                mode_commands = [f"/agent set {mode}" for mode in _AGENT_MODES]
+                all_commands = sorted(set(base_commands + mode_commands))
+                token = stripped
+                for cmd in all_commands:
+                    if cmd.startswith(token):
+                        yield Completion(
+                            cmd,
+                            start_position=-len(token),
+                            display=cmd,
+                            display_meta="command",
+                        )
+                return
 
             # Find the nearest @ that hasn't been closed by a space
             at_pos = text.rfind("@")
@@ -584,9 +624,11 @@ if _PT_AVAILABLE:
 
 def run_repl(agent: EulerAgent) -> None:
     console = Console()
+    mode_state = {"agent_mode": "basic"}
     console.print(
         "[bold cyan]Euler REPL[/bold cyan] — type [bold]/help[/bold] for commands, "
-        "[bold]@[/bold] to reference files/folders"
+        "[bold]@[/bold] to reference files/folders "
+        "[dim](agent mode: basic)[/dim]"
     )
 
     session = _make_session() if _PT_AVAILABLE else None
@@ -605,7 +647,7 @@ def run_repl(agent: EulerAgent) -> None:
             continue
 
         try:
-            _handle_input(console, agent, user_input)
+            _handle_input(console, agent, user_input, mode_state)
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]bye[/yellow]")
             break
@@ -615,7 +657,12 @@ def run_repl(agent: EulerAgent) -> None:
 
 # ── dispatcher ────────────────────────────────────────────────────────────────
 
-def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
+def _handle_input(
+    console: Console,
+    agent: EulerAgent,
+    user_input: str,
+    mode_state: dict[str, str],
+) -> None:
 
     if user_input in {"/exit", "/quit"}:
         console.print("[yellow]bye[/yellow]")
@@ -624,6 +671,10 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
     if user_input == "/help":
         console.print(
             "[bold]Euler REPL commands[/bold]\n"
+            "  /agent                         — show current agent mode\n"
+            "  /agent set <mode>              — set mode until you change it\n"
+            "  /agent modes                    — list available modes\n"
+            "  /agent show <mode>             — detailed mode responsibility/examples\n"
             "  /sql <requirement>               — production SQL generation\n"
             "  /replace <file> <s> <e> <instr>  — rewrite a line range\n"
             "  /convert <file> <lang>           — convert file to another language\n"
@@ -633,11 +684,17 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
             "  /index [full]                    — build/update semantic index\n"
             "  /search <query>                  — semantic code search\n"
             "  /graph                           — build cross-language code graph\n"
+            "  /knowledge-graph [folder]        — save graph to ./Euler/knowledge_graph*.json\n"
             "  @file.ext                        — attach full file to your prompt\n"
             "  @file.ext:start-end              — attach a line range to your prompt\n"
             "  @folder/                         — attach all code files in a folder\n"
             "  /delete @file1 @file2 ...        — delete files (with confirmation)\n"
             "  /exit | /quit                    — exit REPL\n\n"
+            "[dim]Agent mode examples:\n"
+            "  /agent set basic      (default routing)\n"
+            "  /agent set swarm      (always multi-agent pipeline)\n"
+            "  /agent set assistant  (always single-call assistant)\n"
+            "  /agent set coder      (always specialist role)\n\n"
             "[dim]Examples:\n"
             "  fix @ema.py\n"
             "  explain @ema.py:17-22\n"
@@ -646,6 +703,35 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
             "  fix bugs in @euler_agent/ and @ema.py\n"
             "  delete @ema.py @calculator.py\n"
             "  /delete @ema.py @calculator.py[/dim]"
+        )
+        return
+
+    if user_input == "/agent":
+        current = mode_state.get("agent_mode", "basic")
+        console.print(f"[cyan]Current agent mode:[/cyan] [bold]{escape(current)}[/bold]")
+        return
+
+    if user_input in {"/agent modes", "/agent list"}:
+        _print_modes_overview(console)
+        return
+
+    if user_input.startswith("/agent show "):
+        mode_name = user_input.removeprefix("/agent show ").strip().lower()
+        _print_mode_details(console, mode_name)
+        return
+
+    if user_input.startswith("/agent set "):
+        requested = user_input.removeprefix("/agent set ").strip().lower()
+        if requested not in _AGENT_MODES:
+            console.print(
+                "[red]Invalid mode.[/red] Use [bold]/agent modes[/bold] "
+                "to list supported modes."
+            )
+            return
+        mode_state["agent_mode"] = requested
+        console.print(
+            f"[green]Agent mode set to[/green] [bold]{escape(requested)}[/bold] "
+            "[dim](stays active until changed)[/dim]"
         )
         return
 
@@ -759,6 +845,35 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
         _safe_print(console, result)
         return
 
+    if user_input.startswith("/knowledge-graph"):
+        raw_target = user_input.removeprefix("/knowledge-graph").strip()
+        if raw_target:
+            raw_target = raw_target.strip().strip("\"'")
+            raw_target = raw_target.lstrip("@").rstrip(".,;:!?)]}")
+        cwd = Path.cwd().resolve()
+        target_root = (cwd / raw_target).resolve() if raw_target else cwd
+        if not target_root.exists() or not target_root.is_dir():
+            console.print(
+                f"[red]Invalid folder:[/red] {escape(str(target_root))}. "
+                "Provide a valid directory path."
+            )
+            return
+        euler_dir = cwd / "Euler"
+        euler_dir.mkdir(parents=True, exist_ok=True)
+        file_name = _safe_graph_filename_for_target(cwd, target_root)
+        output_file = euler_dir / file_name
+        with console.status("[bold cyan]Building knowledge graph...[/bold cyan]", spinner="dots"):
+            result = build_code_graph(str(target_root), output_path=str(output_file))
+        _safe_print(
+            console,
+            (
+                f"Knowledge graph target: {target_root}\n"
+                f"Saved at: {output_file}\n"
+                f"{result}"
+            ),
+        )
+        return
+
     # ── /convert <file> <lang> ────────────────────────────────────────────────
     if user_input.startswith("/convert "):
         parts = user_input.split(" ", 2)
@@ -808,7 +923,7 @@ def _handle_input(console: Console, agent: EulerAgent, user_input: str) -> None:
         return
 
     # ── free-form prompt ──────────────────────────────────────────────────────
-    _handle_freeform(console, agent, user_input)
+    _handle_freeform(console, agent, user_input, mode_state.get("agent_mode", "basic"))
 
 
 def _handle_delete_command(console: Console, raw_paths: list[str]) -> None:
@@ -858,7 +973,67 @@ def _detect_delete_intent(user_input: str, ref_paths: set[Path]) -> bool:
     return any(word in text for word in _DELETE_WORDS)
 
 
-def _handle_freeform(console: Console, agent: EulerAgent, user_input: str) -> None:
+def _mode_prefixed_prompt(agent_mode: str, prompt: str) -> str:
+    spec = MODE_BY_NAME.get(agent_mode)
+    if spec is None or not spec.prompt_preamble.strip():
+        return prompt
+    return f"{spec.prompt_preamble}\n\n{prompt}"
+
+
+def _print_mode_details(console: Console, mode_name: str) -> None:
+    spec = MODE_BY_NAME.get(mode_name)
+    if spec is None:
+        console.print(
+            f"[red]Unknown mode:[/red] {escape(mode_name)}. "
+            "Use [bold]/agent modes[/bold]."
+        )
+        return
+
+    examples = "\n".join(f"  - {escape(example)}" for example in spec.examples) or "  - (none)"
+    role = spec.specialist_role or "N/A"
+    console.print(
+        Panel(
+            f"[bold]{escape(spec.name)}[/bold]\n"
+            f"[cyan]Summary:[/cyan] {escape(spec.summary)}\n"
+            f"[cyan]Responsibility:[/cyan] {escape(spec.responsibility)}\n"
+            f"[cyan]Execution strategy:[/cyan] {escape(spec.strategy)}\n"
+            f"[cyan]Specialist role:[/cyan] {escape(role)}\n"
+            f"[cyan]Prompt preamble:[/cyan]\n{escape(spec.prompt_preamble)}\n\n"
+            f"[cyan]Examples:[/cyan]\n{examples}",
+            title="Agent Mode Details",
+            border_style="cyan",
+        )
+    )
+
+
+def _print_modes_overview(console: Console) -> None:
+    console.print("[bold]Available agent modes[/bold]")
+    for spec in MODE_SPECS:
+        console.print(
+            f"  - [bold]{escape(spec.name)}[/bold]: {escape(spec.summary)} "
+            f"[dim](strategy: {escape(spec.strategy)})[/dim]"
+        )
+    console.print(
+        "\n[dim]Tip: /agent show <mode> to see responsibilities, prompt, and examples.[/dim]"
+    )
+
+
+def _safe_graph_filename_for_target(cwd: Path, target_root: Path) -> str:
+    if target_root.resolve() == cwd.resolve():
+        return "knowledge_graph.json"
+    safe = "_".join(part for part in target_root.parts if part not in {"/", "\\", ":"})
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", safe).strip("_")
+    if not safe:
+        safe = "selected_folder"
+    return f"knowledge_graph_{safe}.json"
+
+
+def _handle_freeform(
+    console: Console,
+    agent: EulerAgent,
+    user_input: str,
+    agent_mode: str = "basic",
+) -> None:
     """Route free-form prompts, inject file content, call agent, apply patches."""
     expanded_input, notes, ref_paths = _expand_file_references(user_input)
     for note in notes:
@@ -869,15 +1044,80 @@ def _handle_freeform(console: Console, agent: EulerAgent, user_input: str) -> No
         _handle_delete_command(console, [str(p) for p in ref_paths])
         return
 
+    mode = (agent_mode or "basic").strip().lower()
+    if mode not in MODE_BY_NAME:
+        mode = "basic"
     is_quick = _should_use_quick_ask(user_input)
     has_file_refs = bool(ref_paths)
     workdir = Path.cwd()
+    mode_prompt = _mode_prefixed_prompt(mode, expanded_input)
 
+    # ── forced mode: assistant single-call ────────────────────────────────────
+    if mode == "assistant":
+        try:
+            with console.status("[bold cyan]Thinking...[/bold cyan]", spinner="dots"):
+                output = agent.ask(mode_prompt, role="assistant")
+        except Exception as exc:
+            _print_error(console, exc)
+            return
+        _print_output(console, output)
+        return
+
+    # ── forced mode: specialist role single-call ──────────────────────────────
+    if mode in _SPECIALIST_MODES:
+        specialist_prompt = mode_prompt
+        if has_file_refs:
+            specialist_prompt += _build_patch_hint(ref_paths)
+        specialist_role = MODE_BY_NAME[mode].specialist_role or mode
+        try:
+            with console.status(
+                f"[bold cyan]Running specialist ({escape(mode)})...[/bold cyan]",
+                spinner="dots",
+            ):
+                output = agent.ask(specialist_prompt, role=specialist_role)
+        except Exception as exc:
+            _print_error(console, exc)
+            return
+        _print_output(console, output)
+        _apply_and_report(console, output, workdir, ref_paths if has_file_refs else set())
+        return
+
+    # ── forced mode: patch-oriented single-call ────────────────────────────────
+    if mode == "patch":
+        prompt = mode_prompt + (_build_patch_hint(ref_paths) if has_file_refs else "")
+        try:
+            with console.status(
+                "[bold cyan]Thinking and writing patches...[/bold cyan]",
+                spinner="dots",
+            ):
+                output = agent.ask(prompt, role="senior engineer fixing code")
+        except Exception as exc:
+            _print_error(console, exc)
+            return
+        _print_output(console, output)
+        _apply_and_report(console, output, workdir, ref_paths if has_file_refs else set())
+        return
+
+    # ── forced mode: full multi-agent run ─────────────────────────────────────
+    if mode == "swarm":
+        try:
+            with console.status(
+                "[bold cyan]Running agents (may take ~30s)...[/bold cyan]", spinner="dots"
+            ):
+                output = agent.run(mode_prompt)
+        except Exception as exc:
+            _print_error(console, exc)
+            return
+        _print_output(console, output)
+        _apply_and_report(console, output, workdir, set())
+        return
+
+    # ── default mode: existing heuristic behavior ("basic") ───────────────────
     # ── path A: Q&A — fast single call, no file writes ────────────────────────
     if is_quick:
         try:
             with console.status("[bold cyan]Thinking...[/bold cyan]", spinner="dots"):
-                output = agent.ask(expanded_input, role="assistant")
+                output = agent.ask(mode_prompt, role="assistant")
         except Exception as exc:
             _print_error(console, exc)
             return
@@ -887,7 +1127,7 @@ def _handle_freeform(console: Console, agent: EulerAgent, user_input: str) -> No
     # ── path B: action + @file refs — fast call with explicit patch format ────
     if has_file_refs:
         patch_hint = _build_patch_hint(ref_paths)
-        prompted = expanded_input + patch_hint
+        prompted = mode_prompt + patch_hint
         try:
             with console.status(
                 "[bold cyan]Thinking and writing patches...[/bold cyan]", spinner="dots"
@@ -905,7 +1145,7 @@ def _handle_freeform(console: Console, agent: EulerAgent, user_input: str) -> No
         with console.status(
             "[bold cyan]Running agents (may take ~30s)...[/bold cyan]", spinner="dots"
         ):
-            output = agent.run(expanded_input)
+            output = agent.run(mode_prompt)
     except Exception as exc:
         _print_error(console, exc)
         return

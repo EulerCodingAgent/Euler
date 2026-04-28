@@ -27,6 +27,7 @@ class MemoryEntry:
     result: str
     tags: list[str]
     embedding: dict[str, float]
+    lesson_card: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -59,12 +60,14 @@ def add_memory(
 ) -> None:
     """Persist a completed goal/result pair for future retrieval."""
     rows = _load_raw()
-    memory_text = f"{goal.strip()}\n{result.strip()}\n{' '.join(tags or [])}"
+    summary = _build_lesson_card(goal.strip(), result.strip())
+    memory_text = f"{goal.strip()}\n{summary}\n{' '.join(tags or [])}"
     entry = MemoryEntry(
         timestamp=datetime.now(timezone.utc).isoformat(),
         project=project,
         goal=goal.strip(),
         result=result.strip(),
+        lesson_card=summary,
         tags=tags or [],
         embedding=embed(memory_text),
     )
@@ -114,11 +117,32 @@ def search_memory_scored(
             continue
         # Migrate old dense-float embeddings (list[float]) on the fly.
         if isinstance(raw_emb, list):
-            raw_emb = embed(f"{row.get('goal', '')}\n{row.get('result', '')}")
+            raw_emb = embed(
+                f"{row.get('goal', '')}\n"
+                f"{row.get('lesson_card', '') or row.get('result', '')}"
+            )
             row["embedding"] = raw_emb
         score = cosine_sparse(query_vec, raw_emb)
         if score > 0:
             candidates.append((score, row))
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    return [(score, MemoryEntry(**row)) for score, row in candidates[:limit]]
+    results: list[tuple[float, MemoryEntry]] = []
+    for score, row in candidates[:limit]:
+        if "lesson_card" not in row:
+            row["lesson_card"] = _build_lesson_card(
+                str(row.get("goal", "")),
+                str(row.get("result", "")),
+            )
+        results.append((score, MemoryEntry(**row)))
+    return results
+
+
+def _build_lesson_card(goal: str, result: str, max_chars: int = 500) -> str:
+    """
+    Build a compact memory summary tuned for retrieval and prompt injection.
+    """
+    compact = " ".join(result.split())
+    if len(compact) > max_chars:
+        compact = compact[:max_chars] + "... [truncated]"
+    return f"Goal: {goal}\nKey outcome: {compact}"

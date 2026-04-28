@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from difflib import unified_diff
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,36 @@ def _is_risky_file_action(action_type: str, target: str) -> bool:
     return False
 
 
+def _compact_text(text: str, max_chars: int) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars] + "... [truncated]"
+
+
+def _observation_delta(previous: str, current: str, max_chars: int = 1500) -> str:
+    if not previous.strip():
+        return _compact_text(current, max_chars)
+    diff = "".join(
+        unified_diff(
+            previous.splitlines(keepends=True),
+            current.splitlines(keepends=True),
+            fromfile="previous",
+            tofile="current",
+            n=1,
+        )
+    )
+    if not diff.strip():
+        return "No meaningful observation change."
+    return _compact_text(diff, max_chars)
+
+
+def _compact_history(history: list[str], max_items: int = 8, item_chars: int = 220) -> str:
+    if not history:
+        return "None"
+    return "\n".join(_compact_text(item, item_chars) for item in history[-max_items:])
+
+
 def _snapshot_file(snapshot_root: Path, workdir: Path, target_file: Path) -> None:
     rel = target_file.relative_to(workdir)
     destination = snapshot_root / rel
@@ -98,6 +129,7 @@ def run_autopilot(
     """
     wd = str(Path(workdir).resolve())
     observation = "No execution yet."
+    previous_observation = ""
     history: list[str] = []
     mutation_count = 0
     policy = build_policy(
@@ -155,8 +187,9 @@ def run_autopilot(
             f"- Remaining file mutation budget: {policy.max_file_mutations - mutation_count}\n\n"
             f"## Goal\n{goal}\n\n"
             f"## Workdir\n{wd}\n\n"
-            f"## Observations from previous round\n{observation}\n\n"
-            f"## Action history (last 10)\n{chr(10).join(history[-10:]) or 'None'}"
+            f"## Observation delta from previous round\n"
+            f"{_observation_delta(previous_observation, observation)}\n\n"
+            f"## Compact action history (last 8)\n{_compact_history(history)}"
         )
         plan_text = agent.ask(planner_prompt, role="autonomous-production-builder")
         append_audit_event(
@@ -477,7 +510,8 @@ def run_autopilot(
                     },
                 )
 
-        observation = "\n".join(step_outputs)
+        previous_observation = observation
+        observation = _compact_text("\n".join(step_outputs), 3500)
         history.extend(step_outputs)
         append_audit_event(
             audit_file,

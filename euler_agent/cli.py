@@ -21,6 +21,17 @@ app = typer.Typer(help="Euler coding agent CLI")
 console = Console()
 
 
+def _safe_graph_filename_for_target(cwd: Path, target_root: Path) -> str:
+    if target_root.resolve() == cwd.resolve():
+        return "knowledge_graph.json"
+    safe_parts = [p for p in target_root.parts if p not in {"/", "\\", ":"}]
+    safe = "_".join(safe_parts).strip("_")
+    safe = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in safe).strip("_")
+    if not safe:
+        safe = "selected_folder"
+    return f"knowledge_graph_{safe}.json"
+
+
 def _build_agent(cfg: AgentConfig) -> EulerAgent:
     clean_key = cfg.api_key.strip()
     if not clean_key:
@@ -211,6 +222,26 @@ def graph(
     wd = str((workdir or Path.cwd()).resolve())
     message = build_code_graph(wd)
     console.print(f"[green]{message}[/green]")
+
+
+@app.command("knowledge-graph")
+def knowledge_graph(
+    folder: Optional[Path] = typer.Argument(None, help="Optional sub-folder to graph"),
+    workdir: Optional[Path] = typer.Option(None, help="Project root (defaults to cwd)"),
+) -> None:
+    """
+    Build graph for root or selected folder and save into ./Euler.
+    """
+    cwd = (workdir or Path.cwd()).resolve()
+    target = (cwd / folder).resolve() if folder and not folder.is_absolute() else (folder.resolve() if folder else cwd)
+    if not target.exists() or not target.is_dir():
+        raise typer.BadParameter(f"Invalid folder: {target}")
+    euler_dir = cwd / "Euler"
+    euler_dir.mkdir(parents=True, exist_ok=True)
+    out_file = euler_dir / _safe_graph_filename_for_target(cwd, target)
+    message = build_code_graph(str(target), output_path=str(out_file))
+    console.print(f"[green]{message}[/green]")
+    console.print(f"[cyan]Saved knowledge graph:[/cyan] {out_file}")
 
 
 @app.command("convert")

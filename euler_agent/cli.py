@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +52,181 @@ def _build_agent(cfg: AgentConfig) -> EulerAgent:
     )
 
 
+def _probe_connection(agent: EulerAgent) -> None:
+    """
+    Send a tiny probe prompt to verify model connectivity.
+    """
+    probe = agent.ask("Hi", role="assistant")
+    preview = (probe or "").strip().replace("\n", " ")
+    if not preview:
+        preview = "(empty response)"
+    console.print(f"[bold green]Connection OK[/bold green] [dim]AI:[/dim] {preview[:180]}")
+
+
+def _startup_animation() -> None:
+    """
+    Lightweight terminal animation before startup menu.
+    """
+    frames = ["[cyan]•[/cyan]", "[cyan]••[/cyan]", "[cyan]•••[/cyan]"]
+    for frame in frames:
+        console.print(f"[dim]Preparing startup menu {frame}[/dim]")
+        time.sleep(0.08)
+        print("\x1b[1A\x1b[2K", end="", flush=True)
+    console.print("[dim]Preparing startup menu [green]done[/green][/dim]\n")
+
+
+def _arrow_select(
+    title: str,
+    text: str,
+    values: list[tuple[str, str]],
+    default: str,
+) -> str:
+    """
+    In-terminal selector. On Windows uses arrow keys; otherwise numeric fallback.
+    """
+    try:
+        import msvcrt  # type: ignore
+
+        default_idx = 0
+        for i, (value, _) in enumerate(values):
+            if value == default:
+                default_idx = i
+                break
+        idx = default_idx
+        console.print("")
+        console.print(f"[bold cyan]{title}[/bold cyan]")
+        console.print(f"[white]{text}[/white]")
+        console.print("[dim]Use ↑/↓ and Enter (or j/k).[/dim]\n")
+        total_lines = len(values) + 1
+
+        def _draw() -> None:
+            print("\r", end="", flush=True)
+            for i, (_, label) in enumerate(values):
+                prefix = "[bold bright_cyan]→[/bold bright_cyan]" if i == idx else " "
+                color = "[bold white]" if i == idx else "[dim]"
+                end = "[/bold white]" if i == idx else "[/dim]"
+                console.print(f"{prefix} {color}{i + 1}) {label}{end}")
+            print("")
+
+        _draw()
+        while True:
+            ch = msvcrt.getwch()
+            if ch in {"\r", "\n"}:
+                print("\x1b[1A", end="", flush=True)
+                console.print(
+                    f"[green]✓ Selected:[/green] [bold]{values[idx][1]}[/bold]\n"
+                )
+                return values[idx][0]
+            moved = False
+            if ch in {"j", "J"}:
+                idx = (idx + 1) % len(values)
+                moved = True
+            if ch in {"k", "K"}:
+                idx = (idx - 1) % len(values)
+                moved = True
+            elif ch in {"\x00", "\xe0"}:
+                key = msvcrt.getwch()
+                if key == "H":  # up
+                    idx = (idx - 1) % len(values)
+                    moved = True
+                elif key == "P":  # down
+                    idx = (idx + 1) % len(values)
+                    moved = True
+            if moved:
+                print("\x1b[1A" * total_lines, end="", flush=True)
+                _draw()
+    except Exception:
+        pass
+
+    labels = "\n".join(f"  {idx + 1}) {label}" for idx, (_, label) in enumerate(values))
+    console.print(f"\n[bold cyan]{title}[/bold cyan]\n{text}\n{labels}")
+    raw = typer.prompt("Choose option", default="1").strip()
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if 0 <= idx < len(values):
+            return values[idx][0]
+    return default
+
+
+def _interactive_startup_config(cfg: AgentConfig) -> AgentConfig:
+    """
+    Startup wizard shown before entering REPL.
+
+    Keeps existing config support and allows quick cloud/local setup.
+    """
+    choice = _arrow_select(
+        title="Euler Startup",
+        text="Use arrow keys and Enter to choose startup flow.",
+        values=[
+            ("cloud", "Cloud/API model (OpenAI/Anthropic/Gemini)"),
+            ("local", "Local LLM (Ollama/OpenAI-compatible local server)"),
+            ("saved", "Continue with saved config"),
+        ],
+        default="saved",
+    )
+    if choice == "saved":
+        return cfg
+
+    if choice == "cloud":
+        provider_raw = _arrow_select(
+            title="Cloud Provider",
+            text="Select cloud provider.",
+            values=[
+                ("openai", "openai"),
+                ("anthropic", "anthropic"),
+                ("gemini", "gemini"),
+            ],
+            default=cfg.provider if cfg.provider in {"openai", "anthropic", "gemini"} else "gemini",
+        )
+        if provider_raw not in {"openai", "anthropic", "gemini"}:
+            raise typer.BadParameter("Provider must be one of: openai, anthropic, gemini.")
+        model = typer.prompt("Model", default=cfg.model).strip()
+        api_key = typer.prompt("API key", hide_input=False).strip()
+        if not api_key:
+            raise typer.BadParameter("API key cannot be empty for cloud providers.")
+        if provider_raw == "gemini" and not api_key.startswith("AIza"):
+            raise typer.BadParameter("Gemini API keys usually start with 'AIza'.")
+        updated = AgentConfig(
+            provider=provider_raw,  # type: ignore[arg-type]
+            model=model,
+            api_key=api_key,
+            base_url="",
+        )
+        save_config(updated)
+        console.print("[green]Cloud config saved.[/green]")
+        return updated
+
+    local_provider = _arrow_select(
+        title="Local Provider",
+        text="Select local provider/runtime.",
+        values=[
+            ("ollama", "ollama"),
+            ("local", "local (OpenAI-compatible endpoint)"),
+        ],
+        default=cfg.provider if cfg.provider in {"ollama", "local"} else "ollama",
+    )
+    if local_provider not in {"ollama", "local"}:
+        raise typer.BadParameter("Local provider must be 'ollama' or 'local'.")
+    model = typer.prompt("Local model", default=cfg.model if cfg.provider in {"ollama", "local"} else "qwen2.5-coder:7b").strip()
+    default_url = "http://localhost:11434/v1" if local_provider == "ollama" else (cfg.base_url or "http://localhost:1234/v1")
+    base_url = typer.prompt("Base URL", default=default_url).strip()
+    api_key = typer.prompt(
+        "API key (optional for local, press Enter to skip)",
+        default="",
+        show_default=False,
+        hide_input=False,
+    ).strip()
+    updated = AgentConfig(
+        provider=local_provider,  # type: ignore[arg-type]
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+    )
+    save_config(updated)
+    console.print("[green]Local config saved.[/green]")
+    return updated
+
+
 @app.callback(invoke_without_command=True)
 def main(ctx: typer.Context) -> None:
     """
@@ -59,7 +235,14 @@ def main(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is None:
         cfg = load_config()
         print_activation_banner(cfg.provider, cfg.model)
+        _startup_animation()
+        cfg = _interactive_startup_config(cfg)
+        console.print(
+            f"[bold cyan]Using[/bold cyan] [white]provider={cfg.provider}[/white] "
+            f"[white]model={cfg.model}[/white]\n"
+        )
         agent = _build_agent(cfg)
+        _probe_connection(agent)
         run_repl(agent)
 
 

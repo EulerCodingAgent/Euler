@@ -8,13 +8,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-Provider = Literal["openai", "anthropic", "gemini"]
+Provider = Literal["openai", "anthropic", "gemini", "ollama", "local"]
 
 
 class AgentConfig(BaseModel):
     provider: Provider = "gemini"
     model: str = "gemini-2.0-flash"
     api_key: str = Field(default="", repr=False)
+    base_url: str = ""
 
 
 CONFIG_DIR = Path.home() / ".euler_agent"

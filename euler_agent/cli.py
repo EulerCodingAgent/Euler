@@ -34,11 +34,21 @@ def _safe_graph_filename_for_target(cwd: Path, target_root: Path) -> str:
 
 def _build_agent(cfg: AgentConfig) -> EulerAgent:
     clean_key = cfg.api_key.strip()
-    if not clean_key:
+    if cfg.provider in {"openai", "anthropic", "gemini"} and not clean_key:
         raise typer.BadParameter(
             "API key is missing. Run: Euler config set --provider <provider> --model <model>"
         )
-    return EulerAgent(provider=cfg.provider, model_name=cfg.model, api_key=clean_key)
+    if cfg.provider == "local" and not cfg.base_url.strip():
+        raise typer.BadParameter(
+            "Local provider requires base_url. Run: "
+            "Euler config set --provider local --model <model> --base-url <url>"
+        )
+    return EulerAgent(
+        provider=cfg.provider,
+        model_name=cfg.model,
+        api_key=clean_key,
+        base_url=cfg.base_url.strip(),
+    )
 
 
 @app.callback(invoke_without_command=True)
@@ -64,23 +74,43 @@ def show_config() -> None:
     console.print(f"provider={cfg.provider}")
     console.print(f"model={cfg.model}")
     console.print(f"api_key={hidden}")
+    console.print(f"base_url={cfg.base_url or '(not set)'}")
 
 
 @config_app.command("set")
 def set_config(
-    provider: Provider = typer.Option(..., help="openai | anthropic | gemini"),
+    provider: Provider = typer.Option(..., help="openai | anthropic | gemini | ollama | local"),
     model: str = typer.Option(..., help="Model slug for provider"),
-    api_key: str = typer.Option(..., prompt=True, hide_input=False),
+    api_key: Optional[str] = typer.Option(
+        None,
+        help="API key (required for cloud providers; optional for local providers)",
+    ),
+    base_url: Optional[str] = typer.Option(
+        None,
+        help="Endpoint base URL for local/ollama providers",
+    ),
 ) -> None:
-    clean_key = api_key.strip()
-    if not clean_key:
+    clean_key = (api_key or "").strip()
+    if provider in {"openai", "anthropic", "gemini"} and not clean_key:
         raise typer.BadParameter("API key cannot be empty.")
     if provider == "gemini" and not clean_key.startswith("AIza"):
         raise typer.BadParameter(
             "Gemini API keys usually start with 'AIza'. "
             "Please paste a valid Google AI Studio API key."
         )
-    cfg = AgentConfig(provider=provider, model=model, api_key=clean_key)
+    resolved_base_url = (base_url or "").strip()
+    if provider == "ollama" and not resolved_base_url:
+        resolved_base_url = "http://localhost:11434/v1"
+    if provider == "local" and not resolved_base_url:
+        raise typer.BadParameter(
+            "Local provider requires --base-url (e.g. http://localhost:1234/v1)."
+        )
+    cfg = AgentConfig(
+        provider=provider,
+        model=model,
+        api_key=clean_key,
+        base_url=resolved_base_url,
+    )
     save_config(cfg)
     console.print("[green]Config saved.[/green]")
 

@@ -168,8 +168,19 @@ def _workdir_fingerprint(workdir: str) -> str:
 # ---------------------------------------------------------------------------
 
 class EulerAgent:
-    def __init__(self, provider: str, model_name: str, api_key: str) -> None:
-        self.model = get_chat_model(provider=provider, model=model_name, api_key=api_key)
+    def __init__(
+        self,
+        provider: str,
+        model_name: str,
+        api_key: str,
+        base_url: str = "",
+    ) -> None:
+        self.model = get_chat_model(
+            provider=provider,
+            model=model_name,
+            api_key=api_key,
+            base_url=base_url,
+        )
         self._model_id = f"{provider}/{model_name}"
         self._last_run_stats: dict[str, Any] = {}
         self._stats_seq = 0

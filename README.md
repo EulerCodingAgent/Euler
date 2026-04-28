@@ -1,7 +1,7 @@
 # Euler Agent CLI
 
 Euler is a local-first coding agent CLI inspired by tools like Claude Code.
-It runs in your terminal, uses your own API key, and supports OpenAI, Anthropic, and Gemini.
+It runs in your terminal, uses your own API key or local endpoint, and supports OpenAI, Anthropic, Gemini, Ollama, and OpenAI-compatible local servers.
 
 ## Install
 
@@ -21,6 +21,12 @@ pip install -e .
 # default is already Gemini — just set your key:
 Euler config set --provider gemini --model gemini-2.5-flash
 Euler
+
+# Ollama local model (example: qwen/gemma served by Ollama):
+Euler config set --provider ollama --model qwen2.5-coder:7b
+
+# Generic local OpenAI-compatible server (LM Studio/vLLM/etc):
+Euler config set --provider local --model kimi-k2-instruct --base-url http://localhost:1234/v1
 ```
 
 You can also run one-shot tasks:
@@ -56,7 +62,7 @@ Euler knowledge-graph src/
 
 ## Features in this version
 
-- Provider/model selection: OpenAI, Anthropic, Gemini
+- Provider/model selection: OpenAI, Anthropic, Gemini, Ollama, Local OpenAI-compatible
 - API key managed locally in `~/.euler_agent/config.json`
 - Interactive REPL with:
   - free-form coding prompts

@@ -5,8 +5,12 @@ from __future__ import annotations
 import difflib
 import re
 from ast import parse as ast_parse
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from rich.console import Console
 from rich.markup import escape
@@ -35,6 +39,7 @@ except ImportError:  # pragma: no cover
 # ── patterns & constants ──────────────────────────────────────────────────────
 
 _FILE_REF_PATTERN = re.compile(r"@([^\s]+)")
+_URL_PATTERN = re.compile(r"\bhttps?://[^\s<>()\"']+")
 
 # File extensions treated as readable code/text when attaching a folder
 _CODE_EXTENSIONS: frozenset[str] = frozenset({
@@ -66,6 +71,8 @@ _DELETE_WORDS = frozenset({
     "get rid", "trash", "clean up", "cleanup",
 })
 _RANGED_FILE_REF_PATTERN = re.compile(r"^(?P<path>.+):(?P<start>\d+)-(?P<end>\d+)$")
+_WEB_FETCH_TIMEOUT_SEC = 10
+_WEB_CONTENT_CHAR_LIMIT = 8_000
 
 # Matches ```lang\n<body>\n``` (captures body)
 _CODE_BLOCK_RE = re.compile(r"```(?:\w+)?\n(.*?)```", re.DOTALL)
@@ -450,6 +457,116 @@ def _expand_file_references(
     return resolved, notes, ref_paths
 
 
+class _HTMLTextExtractor(HTMLParser):
+    """Extract readable text from HTML while skipping script/style noise."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._chunks: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # type: ignore[override]
+        if tag in {"script", "style", "noscript"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:  # type: ignore[override]
+        if tag in {"script", "style", "noscript"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:  # type: ignore[override]
+        if self._skip_depth > 0:
+            return
+        text = data.strip()
+        if text:
+            self._chunks.append(text)
+
+    def text(self) -> str:
+        merged = " ".join(self._chunks)
+        return re.sub(r"\s+", " ", merged).strip()
+
+
+def _fetch_url_text(url: str) -> str:
+    """Fetch URL content and return cleaned text."""
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Euler-Agent/1.0 (+web-context)",
+            "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=_WEB_FETCH_TIMEOUT_SEC) as resp:
+        content_type = (resp.headers.get("Content-Type", "") or "").lower()
+        charset = resp.headers.get_content_charset() or "utf-8"
+        raw = resp.read(200_000)
+    body = raw.decode(charset, errors="replace")
+    if "html" in content_type or "<html" in body.lower():
+        parser = _HTMLTextExtractor()
+        parser.feed(body)
+        parser.close()
+        text = parser.text()
+    else:
+        text = re.sub(r"\s+", " ", body).strip()
+    if len(text) > _WEB_CONTENT_CHAR_LIMIT:
+        return text[:_WEB_CONTENT_CHAR_LIMIT] + " ... [truncated]"
+    return text
+
+
+def _expand_web_references(user_input: str) -> tuple[str, list[str]]:
+    """
+    Attach URL context from raw prompt URLs for all modes.
+
+    Returns:
+        expanded_prompt  – prompt with web snippets appended
+        notes            – rich-markup lines describing attached URLs
+    """
+    urls = []
+    seen: set[str] = set()
+    for match in _URL_PATTERN.finditer(user_input):
+        raw = match.group(0).rstrip(".,;:!?)]}")
+        if raw in seen:
+            continue
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        seen.add(raw)
+        urls.append(raw)
+
+    if not urls:
+        return user_input, []
+
+    notes: list[str] = []
+    blocks: list[str] = []
+    for url in urls:
+        try:
+            text = _fetch_url_text(url)
+            if not text:
+                notes.append(f"[yellow]Fetched URL but no readable content: {escape(url)}[/yellow]")
+                continue
+            notes.append(f"[cyan]Attached web context: {escape(url)}[/cyan]")
+            blocks.append(
+                f"### Web Source\n"
+                f"[Attached URL: {url}]\n"
+                f"```text\n{text}\n```"
+            )
+        except HTTPError as exc:
+            notes.append(
+                f"[yellow]Failed to fetch {escape(url)} (HTTP {exc.code})[/yellow]"
+            )
+        except URLError as exc:
+            notes.append(
+                f"[yellow]Failed to fetch {escape(url)} ({escape(str(exc.reason))})[/yellow]"
+            )
+        except Exception as exc:
+            notes.append(
+                f"[yellow]Failed to fetch {escape(url)} ({escape(str(exc))})[/yellow]"
+            )
+
+    if not blocks:
+        return user_input, notes
+    expanded = user_input + "\n\n" + "\n\n".join(blocks)
+    return expanded, notes
+
+
 # ── safe print ────────────────────────────────────────────────────────────────
 
 def _safe_print(console: Console, text: str) -> None:
@@ -707,6 +824,7 @@ def _handle_input(
             "  @file.ext                        — attach full file to your prompt\n"
             "  @file.ext:start-end              — attach a line range to your prompt\n"
             "  @folder/                         — attach all code files in a folder\n"
+            "  https://example.com/page         — auto-attach webpage context\n"
             "  /delete @file1 @file2 ...        — delete files (with confirmation)\n"
             "  /exit | /quit                    — exit REPL\n\n"
             "[dim]Agent mode examples:\n"
@@ -1109,6 +1227,8 @@ def _handle_freeform(
 ) -> None:
     """Route free-form prompts, inject file content, call agent, apply patches."""
     expanded_input, notes, ref_paths = _expand_file_references(user_input)
+    expanded_input, web_notes = _expand_web_references(expanded_input)
+    notes.extend(web_notes)
     for note in notes:
         console.print(note)
 

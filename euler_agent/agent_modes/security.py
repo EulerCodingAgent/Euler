@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "steps/code for auth, input handling, secrets, and abuse resistance."
     ),
     prompt_preamble=(
-        "Mode: SECURITY. Prioritize threat modeling and exploitability. Output findings "
-        "with severity and concrete fixes."
+        "Mode: SECURITY. Enforce PLAN -> FIND -> EXECUTE. PLAN defines threat-check "
+        "order, FIND identifies concrete attack surfaces and risky paths, EXECUTE "
+        "returns severity-ranked remediations with production-safe fixes. Keep it "
+        "concise, actionable, and example-free."
     ),
     examples=(
         "audit auth flow in @api/auth.py for OWASP issues",

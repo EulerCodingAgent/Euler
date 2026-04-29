@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "drop-in file outputs."
     ),
     prompt_preamble=(
-        "Mode: CODER. Prefer complete, runnable code. Keep explanations short unless "
-        "asked; prioritize correct file outputs and implementation details."
+        "Mode: CODER. Enforce PLAN -> FIND -> EXECUTE. PLAN lists implementation "
+        "steps, FIND identifies exact target files/functions/types, EXECUTE returns "
+        "complete production-grade code line by line with imports, typing, and robust "
+        "error handling. No placeholders and no examples."
     ),
     examples=(
         "implement JWT middleware in @auth.py",

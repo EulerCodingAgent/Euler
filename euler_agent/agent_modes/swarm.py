@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "work that benefits from parallel role decomposition."
     ),
     prompt_preamble=(
-        "Mode: SWARM. Produce implementation-grade output with explicit files, tests, "
-        "and deployment considerations."
+        "Mode: SWARM. Enforce PLAN -> FIND -> EXECUTE across planner, specialists, "
+        "arbitrator, and reviewer. Require production-grade compact outputs with "
+        "deterministic file-level actions and line-by-line code when implementation "
+        "is needed."
     ),
     examples=(
         "build auth module with RBAC and tests",

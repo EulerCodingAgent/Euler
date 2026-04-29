@@ -53,6 +53,7 @@ from euler_agent.core.prompts import (
 from euler_agent.core.providers import get_chat_model
 from euler_agent.analysis.semantic_index import search_index_scored
 from euler_agent.analysis.code_graph import load_code_graph, related_files_from_graph
+from euler_agent.core.skills import render_skill_protocol
 from euler_agent.optimization.token_optimizer import (
     QueryComplexity,
     TokenOptimizer,
@@ -202,7 +203,11 @@ class EulerAgent:
 
     def ask(self, prompt: str, role: str = "assistant") -> str:
         from euler_agent.core.prompts import PRODUCTION_PREAMBLE
-        system = f"{PRODUCTION_PREAMBLE}\n\nYou are Euler acting as {role}."
+        system = (
+            f"{PRODUCTION_PREAMBLE}\n\n"
+            f"You are Euler acting as {role}.\n\n"
+            f"{render_skill_protocol(role, 'solve the user request with production-ready precision')}"
+        )
         self._last_run_stats = {
             "seq": self._stats_seq + 1,
             "kind": "ask",
@@ -297,6 +302,10 @@ class EulerAgent:
         }
 
     def _planner(self, state: AgentState) -> AgentState:
+        skill_protocol = render_skill_protocol(
+            "strategic planner",
+            "build an execution plan that downstream specialists can implement directly",
+        )
         prompt = (
             f"## User Request\n{state['user_goal']}\n\n"
             f"## Project Memory (related past outcomes)\n"
@@ -305,6 +314,7 @@ class EulerAgent:
             f"{state.get('semantic_context', 'None')}\n\n"
             f"## Project Instructions\n"
             f"{state.get('instruction_docs', 'None')}\n\n"
+            f"## Skill Workflow\n{skill_protocol}\n\n"
             "Produce the full strategic plan in the format described in your role."
         )
         self._record_stage_tokens(state, "planner", SYSTEM_PLANNER, prompt)
@@ -333,17 +343,47 @@ class EulerAgent:
 
     def _parallel_specialists(self, state: AgentState) -> AgentState:
         ctx = _build_base_context(state)
+        def _ctx_with_skill(role: str, objective: str, base_instruction: str) -> str:
+            return (
+                f"{base_instruction}\n\n"
+                f"## Skill Workflow\n{render_skill_protocol(role, objective)}\n\n"
+                f"{ctx}"
+            )
 
         # Full catalogue of available specialists
         all_specialists: dict[str, tuple[str, str]] = {
-            "architect":  (SYSTEM_ARCHITECT,  f"Produce the full architecture blueprint.\n\n{ctx}"),
-            "coder":      (SYSTEM_CODER,       f"Produce the complete implementation.\n\n{ctx}"),
-            "tester":     (SYSTEM_TESTER,      f"Produce the complete test suite.\n\n{ctx}"),
-            "security":   (SYSTEM_SECURITY,    f"Perform a full security review of the plan and implementation.\n\n{ctx}"),
-            "devops":     (SYSTEM_DEVOPS,      f"Produce the full deployment and infra config.\n\n{ctx}"),
-            "db":         (SYSTEM_DB,          f"Design and implement the data layer.\n\n{ctx}"),
-            "documenter": (SYSTEM_DOCUMENTER,  f"Produce all documentation.\n\n{ctx}"),
-            "refactor":   (SYSTEM_REFACTOR,    f"Identify and apply refactoring to any existing relevant code.\n\n{ctx}"),
+            "architect": (
+                SYSTEM_ARCHITECT,
+                _ctx_with_skill("systems architect", "define module contracts and system boundaries", "Produce the full architecture blueprint."),
+            ),
+            "coder": (
+                SYSTEM_CODER,
+                _ctx_with_skill("senior engineer", "deliver the full implementation with complete code", "Produce the complete implementation."),
+            ),
+            "tester": (
+                SYSTEM_TESTER,
+                _ctx_with_skill("qa engineer", "deliver complete test coverage for implemented behavior", "Produce the complete test suite."),
+            ),
+            "security": (
+                SYSTEM_SECURITY,
+                _ctx_with_skill("security engineer", "identify vulnerabilities and provide concrete remediations", "Perform a full security review of the plan and implementation."),
+            ),
+            "devops": (
+                SYSTEM_DEVOPS,
+                _ctx_with_skill("devops engineer", "produce deployable infra and runtime operations setup", "Produce the full deployment and infra config."),
+            ),
+            "db": (
+                SYSTEM_DB,
+                _ctx_with_skill("database engineer", "design schema, migrations, and safe query patterns", "Design and implement the data layer."),
+            ),
+            "documenter": (
+                SYSTEM_DOCUMENTER,
+                _ctx_with_skill("technical writer", "produce implementation-aligned developer documentation", "Produce all documentation."),
+            ),
+            "refactor": (
+                SYSTEM_REFACTOR,
+                _ctx_with_skill("refactor engineer", "improve maintainability without behavior changes", "Identify and apply refactoring to any existing relevant code."),
+            ),
         }
 
         # Restrict to the specialists selected by _classify_query
@@ -391,10 +431,15 @@ class EulerAgent:
         # Use the optimiser to compress specialist outputs before aggregation
         compressed_outputs = _OPTIMIZER.compress_specialist_outputs(state, selected)
 
+        skill_protocol = render_skill_protocol(
+            "lead engineer arbitrator",
+            "merge specialist outputs into one coherent production plan",
+        )
         prompt = (
             f"## User Goal\n{state['user_goal']}\n\n"
             f"## Strategic Plan\n{state.get('plan', '')}\n\n"
             f"{compressed_outputs}\n\n"
+            f"## Skill Workflow\n{skill_protocol}\n\n"
             "Arbitrate all specialist outputs into a single unified strategy."
         )
         self._record_stage_tokens(state, "arbitrator", SYSTEM_ARBITRATOR, prompt)
@@ -410,11 +455,16 @@ class EulerAgent:
                 f"Reason: {state.get('skip_reason', '')}\n"
                 f"Planner confidence: {state.get('planner_confidence', 0.0):.2f}\n\n"
             )
+        skill_protocol = render_skill_protocol(
+            "principal reviewer",
+            "produce the final production-ready output with correctness guarantees",
+        )
         prompt = (
             f"## User Goal\n{state['user_goal']}\n\n"
             f"## Strategic Plan\n{state.get('plan', '')}\n\n"
             f"{skip_note}"
             f"## Arbitrated Strategy\n{state.get('arbitrated_output', '')}\n\n"
+            f"## Skill Workflow\n{skill_protocol}\n\n"
             "Perform the final production review and deliver the complete, "
             "corrected, and deployment-ready answer."
         )

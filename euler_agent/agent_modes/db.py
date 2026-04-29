@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "improvements with safe parameterized access."
     ),
     prompt_preamble=(
-        "Mode: DB. Produce schema + migration quality output with explicit constraints, "
-        "indexes, and rollback considerations."
+        "Mode: DB. Enforce PLAN -> FIND -> EXECUTE. PLAN sequences schema and "
+        "migration work, FIND identifies data constraints and query hotspots, "
+        "EXECUTE returns production-grade DDL/migration/query updates with safe "
+        "parameterized patterns and rollback readiness."
     ),
     examples=(
         "design schema for orders/payments and migration plan",

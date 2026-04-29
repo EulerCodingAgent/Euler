@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "patch flow for file-referenced edits, and full swarm run for broad tasks."
     ),
     prompt_preamble=(
-        "Mode: BASIC. Use concise, high-signal output. Prefer direct answers for "
-        "questions and patch-ready code blocks for concrete edits."
+        "Mode: BASIC. Enforce skill workflow PLAN -> FIND -> EXECUTE. PLAN defines "
+        "ordered production steps, FIND maps exact files/symbols/constraints, EXECUTE "
+        "returns compact implementation-grade output with line-by-line code only when "
+        "code is required. No placeholders, no examples, no unnecessary prose."
     ),
     examples=(
         "explain @auth.py:10-40",

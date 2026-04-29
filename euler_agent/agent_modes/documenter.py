@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "instructions aligned with implementation."
     ),
     prompt_preamble=(
-        "Mode: DOCUMENTER. Write concise, actionable documentation with examples "
-        "and onboarding clarity."
+        "Mode: DOCUMENTER. Enforce PLAN -> FIND -> EXECUTE. PLAN defines doc scope "
+        "order, FIND extracts exact behavior/config/runbook facts, EXECUTE produces "
+        "compact production-grade documentation aligned with actual code and "
+        "operations. No examples."
     ),
     examples=(
         "update README for new /agent commands",

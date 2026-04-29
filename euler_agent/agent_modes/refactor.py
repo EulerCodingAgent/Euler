@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "including duplication removal, complexity reduction, and naming improvements."
     ),
     prompt_preamble=(
-        "Mode: REFACTOR. Preserve behavior while improving structure, readability, "
-        "and maintainability."
+        "Mode: REFACTOR. Enforce PLAN -> FIND -> EXECUTE. PLAN defines "
+        "behavior-preserving change order, FIND identifies duplication and complexity "
+        "hotspots, EXECUTE returns production-grade refactors with unchanged external "
+        "behavior and clear structural improvements."
     ),
     examples=(
         "refactor @euler_agent/repl.py into smaller handlers",

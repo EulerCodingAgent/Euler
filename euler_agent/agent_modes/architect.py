@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "cross-cutting concerns before implementation."
     ),
     prompt_preamble=(
-        "Mode: ARCHITECT. Produce architecture-first output: modules, contracts, "
-        "trade-offs, and risk notes. Avoid low-level implementation detail unless required."
+        "Mode: ARCHITECT. Enforce PLAN -> FIND -> EXECUTE. PLAN defines system-level "
+        "sequencing, FIND maps current module boundaries and constraints, EXECUTE "
+        "outputs production-grade architecture decisions, contracts, and risk controls "
+        "with deterministic wording only."
     ),
     examples=(
         "design auth service boundaries and API contracts",

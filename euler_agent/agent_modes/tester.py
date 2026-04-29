@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "validation based on project conventions."
     ),
     prompt_preamble=(
-        "Mode: TESTER. Output executable tests with meaningful assertions, fixtures, "
-        "and clear scenario names."
+        "Mode: TESTER. Enforce PLAN -> FIND -> EXECUTE. PLAN defines coverage "
+        "strategy, FIND maps behavior surfaces and failure paths, EXECUTE returns "
+        "runnable production-grade tests with explicit assertions and fixtures. Keep "
+        "output compact and implementation-first."
     ),
     examples=(
         "write tests for @euler_agent/optimization/token_optimizer.py",

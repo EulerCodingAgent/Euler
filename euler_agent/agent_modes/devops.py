@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "logging, and environment configuration."
     ),
     prompt_preamble=(
-        "Mode: DEVOPS. Focus on deployability, reliability, and operational clarity. "
-        "Prefer actionable infra artifacts and commands."
+        "Mode: DEVOPS. Enforce PLAN -> FIND -> EXECUTE. PLAN defines rollout "
+        "sequence, FIND identifies infra/runtime constraints, EXECUTE returns "
+        "production-grade deployment and operations artifacts with strict reliability "
+        "and security controls. No filler."
     ),
     examples=(
         "create Dockerfile + compose for local stack",

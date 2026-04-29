@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "especially for tasks with @file references."
     ),
     prompt_preamble=(
-        "Mode: PATCH. Return complete updated files in fenced code blocks. Avoid "
-        "long prose unless needed for safety-critical explanation."
+        "Mode: PATCH. Enforce PLAN -> FIND -> EXECUTE. PLAN states exact patch "
+        "intent, FIND confirms touched files and constraints, EXECUTE returns "
+        "complete updated production-grade file content line by line for direct "
+        "apply. Avoid long prose and examples."
     ),
     examples=(
         "fix @euler_agent/repl.py command parsing",

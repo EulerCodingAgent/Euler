@@ -12,8 +12,10 @@ SPEC = AgentModeSpec(
         "multi-agent orchestration."
     ),
     prompt_preamble=(
-        "Mode: ASSISTANT. Prioritize clarity and correctness. Explain assumptions, "
-        "trade-offs, and give practical next steps."
+        "Mode: ASSISTANT. Enforce PLAN -> FIND -> EXECUTE. PLAN states assumptions "
+        "and decision points, FIND identifies concrete evidence in referenced code, "
+        "EXECUTE gives compact production-safe guidance or exact edits only when "
+        "requested. Keep responses tight, no examples, no filler."
     ),
     examples=(
         "why is semantic cache useful here?",

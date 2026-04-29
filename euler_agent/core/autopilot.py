@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from difflib import unified_diff
+from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, ValidationError
 
 from rich.console import Console
 
@@ -28,6 +32,34 @@ from euler_agent.tools.ops import (
 )
 
 console = Console()
+
+
+class ActionType(str, Enum):
+    READ_FILE = "read_file"
+    WRITE_FILE = "write_file"
+    APPEND_FILE = "append_file"
+    REPLACE_RANGE = "replace_range"
+    REPLACE_IN_FILES = "replace_in_files"
+    RUN_COMMAND = "run_command"
+    DONE = "done"
+
+
+class ActionPayload(BaseModel):
+    type: ActionType
+    path: str | None = None
+    content: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    search: str | None = None
+    replacement: str | None = None
+    paths: list[str] | None = None
+    command: str | None = None
+    reason: str | None = None
+
+
+class PlannerPayload(BaseModel):
+    summary: str = ""
+    actions: list[ActionPayload]
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -113,6 +145,144 @@ def _restore_snapshot(snapshot_root: Path, workdir: Path, touched: set[Path]) ->
     return restored
 
 
+def _is_inside_workdir(workdir: Path, rel_path: str) -> bool:
+    candidate = (workdir / rel_path).resolve()
+    return candidate == workdir or workdir in candidate.parents
+
+
+def _validate_action_contract(action: ActionPayload, workdir: Path) -> tuple[bool, str]:
+    if action.type == ActionType.DONE:
+        return True, ""
+    if action.type == ActionType.READ_FILE:
+        if not action.path:
+            return False, "read_file requires path"
+        if Path(action.path).is_absolute() or not _is_inside_workdir(workdir, action.path):
+            return False, "read_file path must be relative and inside workdir"
+        return True, ""
+    if action.type in {ActionType.WRITE_FILE, ActionType.APPEND_FILE}:
+        if not action.path:
+            return False, f"{action.type.value} requires path"
+        if action.content is None:
+            return False, f"{action.type.value} requires content"
+        if Path(action.path).is_absolute() or not _is_inside_workdir(workdir, action.path):
+            return False, f"{action.type.value} path must be relative and inside workdir"
+        return True, ""
+    if action.type == ActionType.REPLACE_RANGE:
+        if not action.path:
+            return False, "replace_range requires path"
+        if action.content is None:
+            return False, "replace_range requires content"
+        if action.start_line is None or action.end_line is None:
+            return False, "replace_range requires start_line and end_line"
+        if action.start_line <= 0 or action.end_line <= 0 or action.start_line > action.end_line:
+            return False, "replace_range line numbers are invalid"
+        if Path(action.path).is_absolute() or not _is_inside_workdir(workdir, action.path):
+            return False, "replace_range path must be relative and inside workdir"
+        return True, ""
+    if action.type == ActionType.REPLACE_IN_FILES:
+        if not action.paths:
+            return False, "replace_in_files requires paths"
+        if action.search is None or action.replacement is None:
+            return False, "replace_in_files requires search and replacement"
+        for raw_path in action.paths:
+            if Path(raw_path).is_absolute() or not _is_inside_workdir(workdir, raw_path):
+                return False, "replace_in_files paths must be relative and inside workdir"
+        return True, ""
+    if action.type == ActionType.RUN_COMMAND:
+        if not (action.command or "").strip():
+            return False, "run_command requires command"
+        return True, ""
+    return False, f"unsupported action type: {action.type}"
+
+
+def _git_status_paths(workdir: Path) -> set[str]:
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=str(workdir),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return set()
+    paths: set[str] = set()
+    for line in output.splitlines():
+        if len(line) < 4:
+            continue
+        raw = line[3:].strip()
+        if " -> " in raw:
+            _, raw = raw.split(" -> ", 1)
+        if raw:
+            paths.add(raw.replace("\\", "/"))
+    return paths
+
+
+def _read_file_bytes(path: Path) -> bytes | None:
+    if not path.exists():
+        return None
+    try:
+        return path.read_bytes()
+    except Exception:
+        return None
+
+
+def _snapshot_rel_paths(workdir: Path, rel_paths: set[str]) -> dict[str, bytes | None]:
+    snap: dict[str, bytes | None] = {}
+    for rel in rel_paths:
+        path = (workdir / rel).resolve()
+        if path == workdir or workdir not in path.parents:
+            continue
+        snap[rel] = _read_file_bytes(path)
+    return snap
+
+
+def _restore_bytes(path: Path, payload: bytes | None) -> None:
+    if payload is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+
+
+def _restore_command_side_effects(
+    workdir: Path,
+    baseline_dirty_paths: set[str],
+    baseline_snapshots: dict[str, bytes | None],
+) -> list[str]:
+    """
+    Restore files changed by command/verification side effects in this round.
+
+    Strategy:
+      - revert pre-existing dirty paths to their round-start bytes snapshot
+      - remove newly introduced dirty files
+    """
+    restored: list[str] = []
+    now_dirty = _git_status_paths(workdir)
+    introduced = now_dirty - baseline_dirty_paths
+
+    # Restore any pre-existing dirty files that changed during this round.
+    for rel, before in baseline_snapshots.items():
+        current = _read_file_bytes((workdir / rel).resolve())
+        if current != before:
+            _restore_bytes((workdir / rel).resolve(), before)
+            restored.append(str((workdir / rel).resolve()))
+
+    # Best-effort cleanup for newly dirty files from command side effects.
+    for rel in introduced:
+        abs_path = (workdir / rel).resolve()
+        if abs_path == workdir or workdir not in abs_path.parents:
+            continue
+        if abs_path.exists():
+            try:
+                abs_path.unlink()
+                restored.append(str(abs_path))
+            except Exception:
+                # If we cannot unlink (tracked or permission issue), leave as-is.
+                pass
+    return restored
+
+
 def run_autopilot(
     agent: EulerAgent,
     goal: str,
@@ -156,6 +326,9 @@ def run_autopilot(
         console.print(f"[cyan]Autopilot round {i}/{max_rounds}[/cyan]")
         round_snapshot = snapshots_root / f"round_{i}"
         round_snapshot.mkdir(parents=True, exist_ok=True)
+        round_workdir = Path(wd)
+        baseline_dirty_paths = _git_status_paths(round_workdir)
+        baseline_dirty_snapshot = _snapshot_rel_paths(round_workdir, baseline_dirty_paths)
         touched_files: set[Path] = set()
         planner_prompt = (
             "You are Euler Autopilot — an autonomous production-grade coding agent.\n\n"
@@ -217,7 +390,23 @@ def run_autopilot(
             )
             continue
 
-        actions = parsed.get("actions", [])
+        try:
+            planner_payload = PlannerPayload.model_validate(parsed)
+        except ValidationError as exc:
+            observation = f"Planner returned invalid action schema: {exc}"
+            history.append("[planner_error] invalid action schema")
+            append_audit_event(
+                audit_file,
+                {
+                    "type": "planner_error",
+                    "run_id": run_id,
+                    "round": i,
+                    "error": "invalid action schema",
+                },
+            )
+            continue
+
+        actions = planner_payload.actions
         if not actions:
             observation = "Planner returned no actions."
             history.append("[planner_error] empty actions")
@@ -237,12 +426,26 @@ def run_autopilot(
 
         step_outputs: list[str] = []
         for action in actions:
-            action_type = action.get("type", "")
-            reason = action.get("reason", "")
+            action_type = action.type.value
+            reason = action.reason or ""
             if reason:
                 step_outputs.append(f"[reason] {reason}")
+            valid, contract_error = _validate_action_contract(action, round_workdir)
+            if not valid:
+                step_outputs.append(f"[contract_rejected] {contract_error}")
+                append_audit_event(
+                    audit_file,
+                    {
+                        "type": "contract_rejected",
+                        "run_id": run_id,
+                        "round": i,
+                        "action_type": action_type,
+                        "error": contract_error,
+                    },
+                )
+                continue
             if action_type == "done":
-                final = parsed.get("summary", "Objective completed.")
+                final = planner_payload.summary or "Objective completed."
                 history.append(_format_action_result("done", final))
                 append_audit_event(
                     audit_file,
@@ -254,14 +457,14 @@ def run_autopilot(
                 )
                 return "\n".join(history + [f"[audit] run_id={run_id} file={audit_file}"])
             if action_type == "read_file":
-                target = str(Path(wd) / action["path"])
+                target = str(Path(wd) / (action.path or ""))
                 if not ensure_inside_workdir(wd, target):
                     step_outputs.append("[guardrail] read_file blocked (outside workdir)")
                     continue
                 output = read_file(target)
                 step_outputs.append(_format_action_result("read_file", output[:2500]))
             elif action_type == "write_file":
-                target_path = Path(wd) / action["path"]
+                target_path = Path(wd) / (action.path or "")
                 target = str(target_path)
                 if (
                     _is_risky_file_action(action_type, target)
@@ -289,12 +492,12 @@ def run_autopilot(
                 if target_path not in touched_files:
                     _snapshot_file(round_snapshot, Path(wd), target_path)
                     touched_files.add(target_path)
-                output = guarded_write(target, action.get("content", ""))
+                output = guarded_write(target, action.content or "")
                 step_outputs.append(_format_action_result("write_file", output))
                 if output.startswith("Wrote"):
                     mutation_count += 1
             elif action_type == "append_file":
-                target_path = Path(wd) / action["path"]
+                target_path = Path(wd) / (action.path or "")
                 target = str(target_path)
                 if (
                     _is_risky_file_action(action_type, target)
@@ -322,11 +525,11 @@ def run_autopilot(
                 if target_path not in touched_files:
                     _snapshot_file(round_snapshot, Path(wd), target_path)
                     touched_files.add(target_path)
-                output = append_file(target, action.get("content", ""))
+                output = append_file(target, action.content or "")
                 step_outputs.append(_format_action_result("append_file", output))
                 mutation_count += 1
             elif action_type == "replace_range":
-                target_path = Path(wd) / action["path"]
+                target_path = Path(wd) / (action.path or "")
                 target = str(target_path)
                 if not ensure_inside_workdir(wd, target):
                     step_outputs.append("[guardrail] replace_range blocked (outside workdir)")
@@ -339,15 +542,15 @@ def run_autopilot(
                     touched_files.add(target_path)
                 output = guarded_replace_range(
                     target,
-                    int(action.get("start_line", 1)),
-                    int(action.get("end_line", 1)),
-                    action.get("content", ""),
+                    int(action.start_line or 1),
+                    int(action.end_line or 1),
+                    action.content or "",
                 )
                 step_outputs.append(_format_action_result("replace_range", output))
                 if output.startswith("Replaced"):
                     mutation_count += 1
             elif action_type == "replace_in_files":
-                path_objects = [Path(wd) / p for p in action.get("paths", [])]
+                path_objects = [Path(wd) / p for p in (action.paths or [])]
                 paths = [str(p) for p in path_objects]
                 if (
                     any(_is_risky_file_action(action_type, p) for p in paths)
@@ -381,8 +584,8 @@ def run_autopilot(
                         touched_files.add(target_path)
                 output = replace_in_files(
                     paths=sandboxed_paths,
-                    search=action.get("search", ""),
-                    replacement=action.get("replacement", ""),
+                    search=action.search or "",
+                    replacement=action.replacement or "",
                 )
                 step_outputs.append(_format_action_result("replace_in_files", output))
                 if output.startswith("Updated "):
@@ -393,7 +596,7 @@ def run_autopilot(
                     except ValueError:
                         mutation_count += 1
             elif action_type == "run_command":
-                command = action.get("command", "")
+                command = action.command or ""
                 if is_risky_command(command) and policy.require_approval_for_risky and not auto_approve_risky:
                     step_outputs.append("[approval_required] risky command blocked (use --auto-approve-risky)")
                     append_audit_event(
@@ -442,8 +645,14 @@ def run_autopilot(
                     },
                 )
                 exit_code = _extract_exit_code(output)
-                if exit_code not in (None, 0) and touched_files:
-                    restored = _restore_snapshot(round_snapshot, Path(wd), touched_files)
+                if exit_code not in (None, 0):
+                    restored = _restore_snapshot(round_snapshot, Path(wd), touched_files) if touched_files else []
+                    restored_side_effects = _restore_command_side_effects(
+                        round_workdir,
+                        baseline_dirty_paths,
+                        baseline_dirty_snapshot,
+                    )
+                    restored.extend(restored_side_effects)
                     step_outputs.append(
                         _format_action_result(
                             "rollback",
@@ -490,8 +699,14 @@ def run_autopilot(
                     },
                 )
                 exit_code = _extract_exit_code(verification)
-                if exit_code not in (None, 0) and touched_files:
-                    restored = _restore_snapshot(round_snapshot, Path(wd), touched_files)
+                if exit_code not in (None, 0):
+                    restored = _restore_snapshot(round_snapshot, Path(wd), touched_files) if touched_files else []
+                    restored_side_effects = _restore_command_side_effects(
+                        round_workdir,
+                        baseline_dirty_paths,
+                        baseline_dirty_snapshot,
+                    )
+                    restored.extend(restored_side_effects)
                     step_outputs.append(
                         _format_action_result(
                             "rollback",

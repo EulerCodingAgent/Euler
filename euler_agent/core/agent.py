@@ -28,6 +28,7 @@ Token optimisation applied at each stage:
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -67,6 +68,16 @@ from euler_agent.optimization.token_optimizer import (
 # ---------------------------------------------------------------------------
 
 _OPTIMIZER = TokenOptimizer()
+_SPECIALIST_ORDER: list[str] = [
+    "architect",
+    "coder",
+    "tester",
+    "security",
+    "devops",
+    "db",
+    "documenter",
+    "refactor",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +203,33 @@ def _repo_state_fingerprint(workdir: str) -> str:
         return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
     except Exception:
         return _workdir_fingerprint(cwd)
+
+
+def _ordered_specialists(keys: list[str]) -> list[str]:
+    rank = {name: i for i, name in enumerate(_SPECIALIST_ORDER)}
+    return sorted(keys, key=lambda k: rank.get(k, 10_000))
+
+
+def _extract_file_mentions(text: str) -> set[str]:
+    # Heuristic: parse common path-like mentions in specialist output.
+    candidates = re.findall(r"(?:^|[\s`\"'])((?:[\w.-]+/)+[\w.-]+\.\w+)", text or "")
+    return {c.strip() for c in candidates if c.strip()}
+
+
+def _build_conflict_report(state: AgentState, selected: list[str]) -> str:
+    file_to_specialists: dict[str, list[str]] = {}
+    for specialist in selected:
+        output = state.get(f"{specialist}_output", "") or ""
+        for path in _extract_file_mentions(output):
+            file_to_specialists.setdefault(path, []).append(specialist)
+    conflicts = {f: names for f, names in file_to_specialists.items() if len(names) > 1}
+    if not conflicts:
+        return "No explicit file-level conflicts detected from specialist outputs."
+    lines = ["Detected potential file-level conflicts:"]
+    for path in sorted(conflicts):
+        ordered = _ordered_specialists(conflicts[path])
+        lines.append(f"- {path}: {', '.join(ordered)}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +463,11 @@ class EulerAgent:
         }
 
         # Restrict to the specialists selected by _classify_query
-        selected_keys: list[str] = state.get(
+        selected_keys_raw: list[str] = state.get(
             "selected_specialists",
             list(all_specialists.keys()),  # fallback: all
         )
+        selected_keys = _ordered_specialists(selected_keys_raw)
         specialists = {k: v for k, v in all_specialists.items() if k in selected_keys}
         for key, (sys_prompt, human_prompt) in specialists.items():
             self._record_stage_tokens(state, f"specialist:{key}", sys_prompt, human_prompt)
@@ -465,9 +504,20 @@ class EulerAgent:
             "architect", "coder", "tester", "security",
             "devops", "db", "documenter", "refactor",
         ])
+        selected = _ordered_specialists(selected)
 
         # Use the optimiser to compress specialist outputs before aggregation
         compressed_outputs = _OPTIMIZER.compress_specialist_outputs(state, selected)
+        conflict_report = _build_conflict_report(state, selected)
+        merge_policy = (
+            "## Deterministic Merge Policy\n"
+            "- Preserve user goal and planner acceptance criteria as highest priority.\n"
+            "- Specialist precedence for direct conflicts:\n"
+            f"  {', '.join(_SPECIALIST_ORDER)}\n"
+            "- Security constraints override conflicting implementation details.\n"
+            "- Prefer minimally invasive edits when two options are equivalent.\n"
+            "- Output one conflict-resolution decision per conflicting file.\n"
+        )
 
         skill_protocol = render_skill_protocol(
             "lead engineer arbitrator",
@@ -476,6 +526,8 @@ class EulerAgent:
         prompt = (
             f"## User Goal\n{state['user_goal']}\n\n"
             f"## Strategic Plan\n{state.get('plan', '')}\n\n"
+            f"{merge_policy}\n"
+            f"## Conflict Detection\n{conflict_report}\n\n"
             f"{compressed_outputs}\n\n"
             f"## Skill Workflow\n{skill_protocol}\n\n"
             "Arbitrate all specialist outputs into a single unified strategy."

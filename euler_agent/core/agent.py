@@ -37,7 +37,10 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
-from euler_agent.config.context import load_euler_instruction_docs
+from euler_agent.config.context import (
+    build_role_reference_context,
+    load_euler_instruction_docs,
+)
 from euler_agent.memory.store import add_memory, search_memory_scored
 from euler_agent.core.prompts import (
     SYSTEM_ARCHITECT,
@@ -88,6 +91,7 @@ class AgentState(TypedDict, total=False):
     user_goal: str
     workdir: str
     instruction_docs: str
+    role_reference_context: str
     memory_context: str
     semantic_context: str
 
@@ -159,7 +163,9 @@ def _build_base_context(state: AgentState) -> str:
         f"{state.get('memory_context', 'None')}\n\n"
         f"## Semantically Relevant Code Hits\n"
         f"{state.get('semantic_context', 'None')}\n\n"
-        f"## Project Instruction Docs (./Euler/*.md)\n"
+        f"## Role-Matched Knowledge References\n"
+        f"{state.get('role_reference_context', 'None')}\n\n"
+        f"## Project Instruction Docs (./Euler-Knowledge/*.md)\n"
         f"{state.get('instruction_docs', 'None')}"
     )
 
@@ -405,8 +411,14 @@ class EulerAgent:
             complexity,
             plan,
         )
+        role_reference_context = build_role_reference_context(
+            Path(state["workdir"]),
+            state["user_goal"],
+            plan,
+        )
         return {
             "plan": plan,
+            "role_reference_context": role_reference_context,
             "skip_specialists": skip,
             "planner_confidence": confidence,
             "skip_reason": reason,

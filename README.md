@@ -58,6 +58,8 @@ Euler search-code "where is auth token validation implemented"
 Euler graph
 Euler knowledge-graph
 Euler knowledge-graph src/
+Euler role-map
+Euler role-map --list
 ```
 
 ## Features in this version
@@ -75,14 +77,15 @@ Euler knowledge-graph src/
 - Autonomous execution loop with retries and command observations
 - Guardrailed autopilot with command allowlist, workdir sandbox, and mutation limits
 - Multi-agent orchestration with specialist roles (planner -> architect/coder/tester in parallel -> arbitrator -> reviewer)
-- Support for project instruction memory in `./Euler/*.md`
+- Support for project instruction memory in `./Euler-Knowledge/*.md`
 - Persistent long-term memory for previous project goals/results (`Euler memory "<query>"`)
 - Embedding-backed semantic memory retrieval (local sparse TF-IDF; zero native deps)
 - AST-aware patch safety guards for Python edits in autonomous mode
 - Repo semantic indexing for codebase-wide natural language retrieval (`Euler index`, `Euler search-code`)
 - Incremental semantic index updates with optional full rebuild (`Euler index`, `Euler index --full`)
 - Cross-language graph extraction for Python + TS/JS + SQL symbols/relations (`Euler graph`)
-- Knowledge-graph build to `./Euler/knowledge_graph*.json` for root or selected folder (`Euler knowledge-graph [folder]`, REPL `/knowledge-graph [folder]`)
+- Knowledge-graph build to `./Euler-Knowledge/knowledge_graph*.json` for root or selected folder (`Euler knowledge-graph [folder]`, REPL `/knowledge-graph [folder]`)
+- Knowledge file responsibility mapping via `Euler role-map` with listing via `Euler role-map --list`
 - Graph-aware retrieval expansion (uses `code_graph.json` neighbors to improve context precision)
 - Semantic response cache with approximate query matching for near-identical prompts
 - Memory lesson cards (compact summaries) to reduce noisy long-history prompt injection
@@ -102,7 +105,7 @@ Initialize instruction docs:
 Euler init
 ```
 
-This creates `Euler/project.md` in your current repo. Add architecture notes, coding rules, or domain constraints there. Euler injects those docs into agent context automatically.
+This creates `Euler-Knowledge/project.md` in your current repo. Add architecture notes, coding rules, or domain constraints there. Euler injects those docs into agent context automatically.
 
 ## Remaining roadmap toward full Claude-Code parity
 

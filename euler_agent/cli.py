@@ -13,6 +13,13 @@ from euler_agent.core.agent import EulerAgent
 from euler_agent.core.autopilot import run_autopilot
 from euler_agent.ui.avatar import print_activation_banner
 from euler_agent.analysis.code_graph import build_code_graph
+from euler_agent.config.context import (
+    KNOWLEDGE_DIR_NAME,
+    format_file_role_mapping,
+    get_knowledge_dir,
+    list_knowledge_files,
+    save_file_role_mapping,
+)
 from euler_agent.config.settings import AgentConfig, Provider, load_config, save_config
 from euler_agent.memory.store import search_memory
 from euler_agent.analysis.semantic_index import index_path, search_index
@@ -381,7 +388,7 @@ def init_workspace(path: Optional[Path] = typer.Option(None, help="Target projec
     Create Euler instruction folder used as project guidance memory.
     """
     root = (path or Path.cwd()).resolve()
-    instruction_dir = root / "Euler"
+    instruction_dir = get_knowledge_dir(root)
     instruction_dir.mkdir(parents=True, exist_ok=True)
     default_md = instruction_dir / "project.md"
     if not default_md.exists():
@@ -392,6 +399,50 @@ def init_workspace(path: Optional[Path] = typer.Option(None, help="Target projec
             encoding="utf-8",
         )
     console.print(f"[green]Initialized instructions at {instruction_dir}[/green]")
+
+
+@app.command("role-map")
+def role_map(
+    workdir: Optional[Path] = typer.Option(None, help="Project root (defaults to cwd)"),
+    list_only: bool = typer.Option(
+        False,
+        "--list",
+        help="Show all file-responsibility mappings",
+    ),
+) -> None:
+    """
+    Manage file-to-responsibility mapping for files inside ./Euler-Knowledge.
+    """
+    root = (workdir or Path.cwd()).resolve()
+    if list_only:
+        console.print(format_file_role_mapping(root))
+        return
+
+    knowledge_files = list_knowledge_files(root)
+    if not knowledge_files:
+        console.print(
+            f"[yellow]No files found in {KNOWLEDGE_DIR_NAME}. "
+            "Add files first, then run `Euler role-map`.[/yellow]"
+        )
+        return
+
+    knowledge_dir = get_knowledge_dir(root)
+    choices: list[tuple[str, str]] = []
+    for file_path in knowledge_files:
+        rel = str(file_path.relative_to(knowledge_dir)).replace("\\", "/")
+        choices.append((rel, rel))
+
+    selected_rel = _arrow_select(
+        title="File Responsibility Mapping",
+        text="Select a knowledge file to map with a responsibility.",
+        values=choices,
+        default=choices[0][0],
+    )
+    responsibility = typer.prompt("Role / responsibility for this file").strip()
+    if not responsibility:
+        raise typer.BadParameter("Responsibility cannot be empty.")
+    save_file_role_mapping(root, selected_rel, responsibility)
+    console.print(f"[green]Saved mapping:[/green] {selected_rel} -> {responsibility}")
 
 
 @app.command("index")
@@ -443,15 +494,15 @@ def knowledge_graph(
     workdir: Optional[Path] = typer.Option(None, help="Project root (defaults to cwd)"),
 ) -> None:
     """
-    Build graph for root or selected folder and save into ./Euler.
+    Build graph for root or selected folder and save into ./Euler-Knowledge.
     """
     cwd = (workdir or Path.cwd()).resolve()
     target = (cwd / folder).resolve() if folder and not folder.is_absolute() else (folder.resolve() if folder else cwd)
     if not target.exists() or not target.is_dir():
         raise typer.BadParameter(f"Invalid folder: {target}")
-    euler_dir = cwd / "Euler"
-    euler_dir.mkdir(parents=True, exist_ok=True)
-    out_file = euler_dir / _safe_graph_filename_for_target(cwd, target)
+    knowledge_dir = get_knowledge_dir(cwd)
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    out_file = knowledge_dir / _safe_graph_filename_for_target(cwd, target)
     message = build_code_graph(str(target), output_path=str(out_file))
     console.print(f"[green]{message}[/green]")
     console.print(f"[cyan]Saved knowledge graph:[/cyan] {out_file}")

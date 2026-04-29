@@ -61,6 +61,13 @@ from euler_agent.repl_support.references import (
     expand_web_references,
     fetch_url_text,
 )
+from euler_agent.config.context import (
+    KNOWLEDGE_DIR_NAME,
+    format_file_role_mapping,
+    get_knowledge_dir,
+    list_knowledge_files,
+    save_file_role_mapping,
+)
 
 # ── prompt_toolkit (optional — graceful fallback to plain input) ──────────────
 try:
@@ -432,7 +439,9 @@ def _handle_input(
             "  /index [full]                    — build/update semantic index\n"
             "  /search <query>                  — semantic code search\n"
             "  /graph                           — build cross-language code graph\n"
-            "  /knowledge-graph [folder]        — save graph to ./Euler/knowledge_graph*.json\n"
+            f"  /knowledge-graph [folder]        — save graph to ./{KNOWLEDGE_DIR_NAME}/knowledge_graph*.json\n"
+            f"  /role-map                        — map a file in ./{KNOWLEDGE_DIR_NAME} to a responsibility\n"
+            "  /role-map --list                 — show all saved file-role mappings\n"
             "  /pick <query>                    — fuzzy-select files and queue @refs\n"
             "  /strict-patch on|off             — enforce unified diff in patch mode\n"
             "  @file.ext                        — attach full file to your prompt\n"
@@ -477,6 +486,10 @@ def _handle_input(
     if cmd and cmd.name == "/pick":
         query = cmd.payload
         _fuzzy_file_pick(console, Path.cwd(), query, mode_state)
+        return
+
+    if cmd and cmd.name == "/role-map":
+        _handle_role_map_command(console, cmd.payload)
         return
 
     if user_input in {"/agent modes", "/agent list"}:
@@ -626,10 +639,10 @@ def _handle_input(
                 "Provide a valid directory path."
             )
             return
-        euler_dir = cwd / "Euler"
-        euler_dir.mkdir(parents=True, exist_ok=True)
+        knowledge_dir = get_knowledge_dir(cwd)
+        knowledge_dir.mkdir(parents=True, exist_ok=True)
         file_name = _safe_graph_filename_for_target(cwd, target_root)
-        output_file = euler_dir / file_name
+        output_file = knowledge_dir / file_name
         with console.status("[bold cyan]Building knowledge graph...[/bold cyan]", spinner="dots"):
             result = build_code_graph(str(target_root), output_path=str(output_file))
         _safe_print(
@@ -731,6 +744,50 @@ def _handle_delete_command(console: Console, raw_paths: list[str]) -> None:
             console.print(f"[bold green]DELETED:[/bold green] {escape(str(p.name))}")
         except Exception as exc:
             console.print(f"[red]Failed to delete {escape(str(p))}: {escape(str(exc))}[/red]")
+
+
+def _handle_role_map_command(console: Console, payload: str) -> None:
+    """Manage file-role mappings directly from REPL."""
+    raw = payload.strip().lower()
+    if raw in {"--list", "list"}:
+        _safe_print(console, format_file_role_mapping(Path.cwd().resolve()))
+        return
+
+    cwd = Path.cwd().resolve()
+    knowledge_dir = get_knowledge_dir(cwd)
+    files = list_knowledge_files(cwd)
+    if not files:
+        console.print(
+            f"[yellow]No files found in {KNOWLEDGE_DIR_NAME}. "
+            "Add files first, then run /role-map.[/yellow]"
+        )
+        return
+
+    console.print(
+        f"[bold]Select file to map from ./{KNOWLEDGE_DIR_NAME}[/bold] "
+        "(comma list not supported here):"
+    )
+    for idx, file_path in enumerate(files, 1):
+        rel = str(file_path.relative_to(knowledge_dir)).replace("\\", "/")
+        console.print(f"  {idx:>2}. {escape(rel)}")
+
+    choice = console.input("Select file number: ").strip()
+    if not choice.isdigit():
+        console.print("[yellow]Cancelled: invalid selection.[/yellow]")
+        return
+    selected_idx = int(choice)
+    if selected_idx < 1 or selected_idx > len(files):
+        console.print("[yellow]Cancelled: selection out of range.[/yellow]")
+        return
+
+    selected = files[selected_idx - 1]
+    rel = str(selected.relative_to(knowledge_dir)).replace("\\", "/")
+    responsibility = console.input("Role / responsibility: ").strip()
+    if not responsibility:
+        console.print("[yellow]Cancelled: responsibility cannot be empty.[/yellow]")
+        return
+    save_file_role_mapping(cwd, rel, responsibility)
+    console.print(f"[green]Saved mapping:[/green] {escape(rel)} -> {escape(responsibility)}")
 
 
 def _detect_delete_intent(user_input: str, ref_paths: set[Path]) -> bool:

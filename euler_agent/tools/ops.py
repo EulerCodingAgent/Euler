@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import shlex
 from ast import parse as ast_parse
 from pathlib import Path
 from typing import Iterable
@@ -74,11 +75,14 @@ def replace_in_files(paths: Iterable[str], search: str, replacement: str) -> str
 
 def run_terminal_command(command: str, cwd: str | None = None) -> str:
     """
-    Execute shell command and capture both output streams.
+    Execute command safely without invoking a shell.
     """
+    parsed = shlex.split(command, posix=False)
+    if not parsed:
+        return "exit_code=1\nstdout:\n\nstderr:\nEmpty command."
     completed = subprocess.run(
-        command,
-        shell=True,
+        parsed,
+        shell=False,
         cwd=cwd,
         text=True,
         capture_output=True,

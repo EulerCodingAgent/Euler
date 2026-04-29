@@ -28,6 +28,7 @@ Token optimisation applied at each stage:
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, TypedDict
@@ -164,6 +165,35 @@ def _workdir_fingerprint(workdir: str) -> str:
     return hashlib.md5(workdir.encode()).hexdigest()[:8]
 
 
+def _repo_state_fingerprint(workdir: str) -> str:
+    """
+    Hash repository state so cache invalidates when code changes.
+
+    Uses:
+      - git HEAD
+      - git status --porcelain
+    Falls back to workdir fingerprint for non-git folders.
+    """
+    cwd = str(Path(workdir).resolve())
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=cwd,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        raw = f"{cwd}|{head}|{status}"
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return _workdir_fingerprint(cwd)
+
+
 # ---------------------------------------------------------------------------
 # Agent class
 # ---------------------------------------------------------------------------
@@ -176,15 +206,23 @@ class EulerAgent:
         api_key: str,
         base_url: str = "",
     ) -> None:
-        self.model = get_chat_model(
-            provider=provider,
-            model=model_name,
-            api_key=api_key,
-            base_url=base_url,
-        )
+        self._provider = provider
+        self._model_name = model_name
+        self._api_key = api_key
+        self._base_url = base_url
+        self.model = get_chat_model(provider=provider, model=model_name, api_key=api_key, base_url=base_url)
         self._model_id = f"{provider}/{model_name}"
         self._last_run_stats: dict[str, Any] = {}
         self._stats_seq = 0
+        self._max_specialist_workers = 3
+
+    def _new_model_client(self):
+        return get_chat_model(
+            provider=self._provider,
+            model=self._model_name,
+            api_key=self._api_key,
+            base_url=self._base_url,
+        )
 
     def _record_stage_tokens(
         self,
@@ -396,11 +434,11 @@ class EulerAgent:
             self._record_stage_tokens(state, f"specialist:{key}", sys_prompt, human_prompt)
 
         results: dict[str, str] = {}
-        workers = max(1, len(specialists))
+        workers = max(1, min(len(specialists), self._max_specialist_workers))
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             future_to_key = {
-                pool.submit(_invoke, self.model, sys_prompt, human_prompt): key
+                pool.submit(_invoke, self._new_model_client(), sys_prompt, human_prompt): key
                 for key, (sys_prompt, human_prompt) in specialists.items()
             }
             for future in as_completed(future_to_key):
@@ -511,10 +549,11 @@ class EulerAgent:
         cache_hit = False
 
         # --- response cache check (fast path) ---
+        repo_fingerprint = _repo_state_fingerprint(resolved_workdir)
         cache_key = _OPTIMIZER.make_cache_key(
             self._model_id,
             user_goal,
-            _workdir_fingerprint(resolved_workdir),
+            repo_fingerprint,
         )
         cached = _OPTIMIZER.get_cached_response(cache_key)
         if cached is not None:
@@ -532,7 +571,7 @@ class EulerAgent:
         semantic_cached = _OPTIMIZER.get_semantic_cached_response(
             self._model_id,
             user_goal,
-            _workdir_fingerprint(resolved_workdir),
+            repo_fingerprint,
         )
         if semantic_cached is not None:
             cache_hit = True
@@ -599,7 +638,7 @@ class EulerAgent:
             response=final,
             model_id=self._model_id,
             query=user_goal,
-            context_fingerprint=_workdir_fingerprint(resolved_workdir),
+            context_fingerprint=repo_fingerprint,
         )
         add_memory(
             project=resolved_workdir,

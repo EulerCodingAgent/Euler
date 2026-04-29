@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -211,15 +212,30 @@ class TokenOptimizer:
           - 6+ signals   → FULL  (no point restricting — user wants everything)
         """
         lower = query.lower()
+        tokens = set(re.findall(r"[a-z0-9_./-]+", lower))
 
         triggered: list[str] = []
         for specialist, signals in _SPECIALIST_SIGNALS.items():
-            if any(sig in lower for sig in signals):
+            score = 0
+            for sig in signals:
+                sig_lower = sig.lower()
+                if " " in sig_lower:
+                    if sig_lower in lower:
+                        score += 2
+                elif sig_lower in tokens or sig_lower in lower:
+                    score += 1
+            if score >= 1:
                 triggered.append(specialist)
 
         # Coder is the default workhorse — always include it for action queries
         if "coder" not in triggered:
             triggered.append("coder")
+
+        if any(k in lower for k in ("end-to-end", "full pipeline", "all agents", "complete system")):
+            return OptimizationResult(
+                complexity=QueryComplexity.FULL,
+                selected_specialists=ALL_SPECIALISTS[:],
+            )
 
         n = len(triggered)
 

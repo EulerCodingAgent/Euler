@@ -421,7 +421,14 @@ def run_autopilot(
                         },
                     )
                     continue
-                output = run_terminal_command(command, cwd=wd)
+                try:
+                    output = run_terminal_command(command, cwd=wd)
+                except Exception as exc:
+                    output = (
+                        "exit_code=1\n"
+                        "stdout:\n\n"
+                        f"stderr:\nFailed to execute command safely: {exc}"
+                    )
                 step_outputs.append(_format_action_result("run_command", output[-3500:]))
                 append_audit_event(
                     audit_file,
@@ -463,7 +470,14 @@ def run_autopilot(
         if verify_command:
             allowed, reason_message = is_command_allowed(verify_command, policy)
             if allowed:
-                verification = run_terminal_command(verify_command, cwd=wd)
+                try:
+                    verification = run_terminal_command(verify_command, cwd=wd)
+                except Exception as exc:
+                    verification = (
+                        "exit_code=1\n"
+                        "stdout:\n\n"
+                        f"stderr:\nFailed to execute verification command safely: {exc}"
+                    )
                 step_outputs.append(_format_action_result("verify_command", verification[-2500:]))
                 append_audit_event(
                     audit_file,

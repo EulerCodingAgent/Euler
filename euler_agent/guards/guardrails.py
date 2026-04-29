@@ -19,7 +19,7 @@ DEFAULT_ALLOWED_COMMAND_PREFIXES = (
     "git diff",
 )
 
-BLOCKED_COMMAND_TOKENS = ("&&", ";", "|", ">", "<", "rm ", "rmdir ", "del ", "format ")
+BLOCKED_COMMAND_TOKENS = ("&&", ";", "|", ">", "<", "\n", "\r", "rm ", "rmdir ", "del ", "format ", "`")
 RISKY_COMMAND_HINTS = (
     "git push",
     "git commit",

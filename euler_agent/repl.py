@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import difflib
 import re
-from ast import parse as ast_parse
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -16,6 +15,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
+from pydantic import BaseModel, ValidationError
 
 from euler_agent.agent_modes import MODE_BY_NAME, MODE_SPECS
 from euler_agent.core.agent import EulerAgent
@@ -23,6 +23,7 @@ from euler_agent.core.autopilot import run_autopilot
 from euler_agent.analysis.code_graph import build_code_graph
 from euler_agent.memory.store import search_memory
 from euler_agent.analysis.semantic_index import index_path, search_index
+from euler_agent.guards.safety import validate_by_extension
 from euler_agent.tools.ops import read_file, replace_range, write_file
 
 # ── prompt_toolkit (optional — graceful fallback to plain input) ──────────────
@@ -76,11 +77,25 @@ _WEB_CONTENT_CHAR_LIMIT = 8_000
 
 # Matches ```lang\n<body>\n``` (captures body)
 _CODE_BLOCK_RE = re.compile(r"```(?:\w+)?\n(.*?)```", re.DOTALL)
+_JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
 # Detects a file-path comment as the first line of a code block
 _FILE_PATH_COMMENT_RE = re.compile(
     r"^(?:#|//|/\*)\s*(?:file:\s*)?(?P<path>[^\s*]+\.\w+)"
 )
+
+
+class _PatchEdit(BaseModel):
+    path: str
+    operation: Literal["write", "delete"] = "write"
+    content: str | None = None
+
+
+class _PatchEnvelope(BaseModel):
+    edits: list[_PatchEdit]
+
+
+PatchTuple = tuple[Path, str | None, Literal["write", "delete"]]
 
 # Verbs that imply an action → full pipeline or patch path
 _ACTION_VERBS = frozenset({
@@ -91,6 +106,7 @@ _ACTION_VERBS = frozenset({
     "edit", "modify", "clean", "format", "lint", "upgrade", "extend",
     "complete", "finish", "solve", "debug",
 })
+_NON_DELETE_ACTION_VERBS = frozenset(v for v in _ACTION_VERBS if v not in {"delete", "remove", "rm"})
 
 # First words that mark a question → fast agent.ask()
 _QUESTION_FIRST_WORDS = frozenset({
@@ -107,20 +123,56 @@ _SPECIALIST_MODES: frozenset[str] = frozenset(
 
 # ── patch extraction & approval ────────────────────────────────────────────────
 
+def _is_allowed_derived_write_path(candidate: Path, allowed_files: set[Path], workdir: Path) -> bool:
+    """
+    Allow safe creation of new files derived from attached files.
+
+    Example: attached `test/card.ts` can produce `test/card.py`.
+    """
+    if not allowed_files:
+        return True
+    try:
+        rel = candidate.relative_to(workdir)
+    except ValueError:
+        return False
+    if candidate.exists():
+        return any(candidate == af for af in allowed_files)
+    rel_norm = str(rel).replace("\\", "/")
+    for af in allowed_files:
+        try:
+            af_rel = af.relative_to(workdir)
+        except ValueError:
+            continue
+        af_rel_norm = str(af_rel).replace("\\", "/")
+        # same directory + same stem (card.ts -> card.py)
+        if rel.parent == af_rel.parent and rel.stem == af_rel.stem:
+            return True
+        # same stem anywhere in repo path
+        if candidate.stem == af.stem:
+            return True
+        # exact match remains allowed
+        if rel_norm == af_rel_norm:
+            return True
+    return False
+
+
 def _extract_patches(
     response: str,
     console: Console,
     workdir: Path,
     allowed_files: set[Path],
-) -> list[tuple[Path, str]]:
+) -> list[PatchTuple]:
     """
     Scan LLM response for fenced code blocks and return (path, new_content) pairs.
     Nothing is written to disk here — writing happens only after user approval.
     """
-    patches: list[tuple[Path, str]] = []
+    patches: list[PatchTuple] = []
     seen: set[Path] = set()
 
     for block_match in _CODE_BLOCK_RE.finditer(response):
+        fenced_block = response[block_match.start() : block_match.end()]
+        if fenced_block.lstrip().lower().startswith("```json"):
+            continue
         body = block_match.group(1)
         lines = body.splitlines()
         if not lines:
@@ -160,6 +212,13 @@ def _extract_patches(
                     candidate = af
                     break
             if candidate is None:
+                # When files were explicitly attached, do not allow model-invented
+                # paths outside that attachment set.
+                if allowed_files:
+                    console.print(
+                        f"[yellow]Skipped {escape(raw_path)} — not part of attached files[/yellow]"
+                    )
+                    continue
                 candidate = parsed if parsed.is_absolute() else (workdir / parsed).resolve()
 
         # Safety: must stay inside workdir
@@ -171,6 +230,12 @@ def _extract_patches(
             )
             continue
 
+        if not _is_allowed_derived_write_path(candidate, allowed_files, workdir):
+            console.print(
+                f"[yellow]Skipped {escape(str(candidate))} — not an allowed derived target[/yellow]"
+            )
+            continue
+
         if candidate in seen:
             continue
         seen.add(candidate)
@@ -179,20 +244,240 @@ def _extract_patches(
         if not code.strip():
             continue
 
-        # Python AST validation (reject before even showing diff)
-        if candidate.suffix == ".py":
-            try:
-                ast_parse(code)
-            except SyntaxError as exc:
-                console.print(
-                    f"[yellow]Skipped {escape(candidate.name)} — "
-                    f"syntax error: {escape(str(exc))}[/yellow]"
-                )
-                continue
+        ok, message = validate_by_extension(candidate, code)
+        if not ok:
+            console.print(
+                f"[yellow]Skipped {escape(candidate.name)} — validation failed: "
+                f"{escape(message)}[/yellow]"
+            )
+            continue
 
-        patches.append((candidate, code))
+        patches.append((candidate, code, "write"))
 
     return patches
+
+
+def _extract_json_protocol_patches(
+    response: str,
+    console: Console,
+    workdir: Path,
+    allowed_files: set[Path],
+) -> list[PatchTuple] | None:
+    """
+    Extract strict JSON patch protocol payload:
+      {"edits":[{"path":"relative/or/absolute","content":"complete file"}]}
+    """
+    match = _JSON_BLOCK_RE.search(response)
+    if not match:
+        return []
+
+    raw = match.group(1).strip()
+    try:
+        payload = _PatchEnvelope.model_validate_json(raw)
+    except ValidationError as exc:
+        try:
+            payload_dict = _parse_relaxed_patch_payload(raw)
+            payload = _PatchEnvelope.model_validate(payload_dict)
+        except Exception:
+            console.print(f"[yellow]Invalid JSON patch payload: {escape(str(exc))}[/yellow]")
+            return None
+    except Exception as exc:
+        try:
+            payload_dict = _parse_relaxed_patch_payload(raw)
+            payload = _PatchEnvelope.model_validate(payload_dict)
+        except Exception:
+            console.print(f"[yellow]Failed to parse JSON patch payload: {escape(str(exc))}[/yellow]")
+            return None
+
+    patches: list[PatchTuple] = []
+    seen: set[Path] = set()
+    for edit in payload.edits:
+        raw_path = edit.path.strip()
+        parsed = Path(raw_path)
+        candidate: Path | None = None
+        for af in allowed_files:
+            norm_raw = raw_path.replace("\\", "/")
+            norm_af = str(af).replace("\\", "/")
+            if af.name == parsed.name or norm_af.endswith("/" + norm_raw):
+                candidate = af
+                break
+        if candidate is None:
+            if allowed_files:
+                candidate = parsed if parsed.is_absolute() else (workdir / parsed).resolve()
+            else:
+                candidate = parsed if parsed.is_absolute() else (workdir / parsed).resolve()
+        try:
+            candidate.relative_to(workdir)
+        except ValueError:
+            console.print(f"[yellow]Skipped {escape(str(candidate))} — outside workdir[/yellow]")
+            continue
+        if edit.operation == "write" and not _is_allowed_derived_write_path(candidate, allowed_files, workdir):
+            console.print(
+                f"[yellow]Skipped {escape(str(candidate))} — not an allowed derived target[/yellow]"
+            )
+            continue
+        if edit.operation == "delete" and allowed_files and candidate not in allowed_files:
+            console.print(
+                f"[yellow]Skipped {escape(str(candidate))} — delete allowed only for attached files[/yellow]"
+            )
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if edit.operation == "delete":
+            patches.append((candidate, None, "delete"))
+            continue
+        if edit.content is None:
+            console.print(
+                f"[yellow]Skipped {escape(candidate.name)} — missing content for write operation[/yellow]"
+            )
+            continue
+        content = edit.content if edit.content.endswith("\n") else (edit.content + "\n")
+        ok, message = validate_by_extension(candidate, content)
+        if not ok:
+            console.print(
+                f"[yellow]Skipped {escape(candidate.name)} — validation failed: "
+                f"{escape(message)}[/yellow]"
+            )
+            continue
+        patches.append((candidate, content, "write"))
+    return patches
+
+
+def _parse_relaxed_patch_payload(raw: str) -> dict[str, Any]:
+    """
+    Parse a relaxed JSON payload for patch protocol.
+
+    Accepts multiline (unescaped) string content values that strict JSON rejects.
+    Supported structure:
+      {"edits":[{"path":"...","operation":"write|delete","content":"..."}, ...]}
+    """
+    i = 0
+    n = len(raw)
+
+    def skip_ws() -> None:
+        nonlocal i
+        while i < n and raw[i] in " \t\r\n":
+            i += 1
+
+    def parse_string() -> str:
+        nonlocal i
+        if i >= n or raw[i] != '"':
+            raise ValueError("expected string")
+        i += 1
+        out: list[str] = []
+        while i < n:
+            ch = raw[i]
+            if ch == "\\":
+                i += 1
+                if i >= n:
+                    break
+                esc = raw[i]
+                if esc == "n":
+                    out.append("\n")
+                elif esc == "r":
+                    out.append("\r")
+                elif esc == "t":
+                    out.append("\t")
+                elif esc == '"':
+                    out.append('"')
+                elif esc == "\\":
+                    out.append("\\")
+                else:
+                    out.append(esc)
+                i += 1
+                continue
+            if ch == '"':
+                i += 1
+                return "".join(out)
+            out.append(ch)
+            i += 1
+        raise ValueError("unterminated string")
+
+    def parse_literal() -> Any:
+        nonlocal i
+        if raw.startswith("null", i):
+            i += 4
+            return None
+        if raw.startswith("true", i):
+            i += 4
+            return True
+        if raw.startswith("false", i):
+            i += 5
+            return False
+        raise ValueError("unsupported literal")
+
+    def parse_value() -> Any:
+        nonlocal i
+        skip_ws()
+        if i >= n:
+            raise ValueError("unexpected end")
+        ch = raw[i]
+        if ch == '"':
+            return parse_string()
+        if ch == "{":
+            return parse_object()
+        if ch == "[":
+            return parse_array()
+        return parse_literal()
+
+    def parse_object() -> dict[str, Any]:
+        nonlocal i
+        if raw[i] != "{":
+            raise ValueError("expected object")
+        i += 1
+        obj: dict[str, Any] = {}
+        skip_ws()
+        if i < n and raw[i] == "}":
+            i += 1
+            return obj
+        while i < n:
+            skip_ws()
+            key = parse_string()
+            skip_ws()
+            if i >= n or raw[i] != ":":
+                raise ValueError("expected ':'")
+            i += 1
+            value = parse_value()
+            obj[key] = value
+            skip_ws()
+            if i < n and raw[i] == ",":
+                i += 1
+                continue
+            if i < n and raw[i] == "}":
+                i += 1
+                return obj
+            raise ValueError("expected ',' or '}'")
+        raise ValueError("unterminated object")
+
+    def parse_array() -> list[Any]:
+        nonlocal i
+        if raw[i] != "[":
+            raise ValueError("expected array")
+        i += 1
+        arr: list[Any] = []
+        skip_ws()
+        if i < n and raw[i] == "]":
+            i += 1
+            return arr
+        while i < n:
+            arr.append(parse_value())
+            skip_ws()
+            if i < n and raw[i] == ",":
+                i += 1
+                continue
+            if i < n and raw[i] == "]":
+                i += 1
+                return arr
+            raise ValueError("expected ',' or ']'")
+        raise ValueError("unterminated array")
+
+    skip_ws()
+    payload = parse_object()
+    skip_ws()
+    if i != n:
+        raise ValueError("trailing content")
+    return payload
 
 
 def _show_diff(console: Console, path: Path, old: str, new: str) -> None:
@@ -212,7 +497,7 @@ def _show_diff(console: Console, path: Path, old: str, new: str) -> None:
 
 
 def _review_and_apply(
-    patches: list[tuple[Path, str]],
+    patches: list[PatchTuple],
     console: Console,
     workdir: Path,
 ) -> list[Path]:
@@ -224,20 +509,23 @@ def _review_and_apply(
     if not patches:
         return []
 
-    written: list[Path] = []
+    pending_ops: list[PatchTuple] = []
     apply_all = False
 
-    for path, new_content in patches:
+    for path, new_content, operation in patches:
         old_content = path.read_text(encoding="utf-8") if path.exists() else ""
         is_new = not path.exists()
+        target_content = "" if operation == "delete" else (new_content or "")
 
-        if old_content == new_content:
+        if old_content == target_content:
             console.print(f"[dim]{path.name}: no changes[/dim]")
             continue
 
         # ── show header + diff ────────────────────────────────────────────────
         console.print()
-        if is_new:
+        if operation == "delete":
+            console.print(Panel(f"[bold red]Delete file:[/bold red] {escape(path.name)}", padding=(0, 1)))
+        elif is_new:
             console.print(
                 Panel(f"[bold cyan]New file:[/bold cyan] {escape(path.name)}", padding=(0, 1))
             )
@@ -252,12 +540,10 @@ def _review_and_apply(
                     padding=(0, 1),
                 )
             )
-        _show_diff(console, path, old_content, new_content)
+        _show_diff(console, path, old_content, target_content)
 
         if apply_all:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(new_content, encoding="utf-8")
-            written.append(path)
+            pending_ops.append((path, new_content, operation))
             console.print(f"[bold green]APPLIED[/bold green] {escape(path.name)}")
             continue
 
@@ -275,9 +561,7 @@ def _review_and_apply(
             choice = "y"
 
         if choice in {"y", "yes"}:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(new_content, encoding="utf-8")
-            written.append(path)
+            pending_ops.append((path, new_content, operation))
             console.print(f"[bold green]APPLIED[/bold green] {escape(path.name)}")
         elif choice in {"q", "quit"}:
             console.print("[yellow]Stopped — remaining changes discarded.[/yellow]")
@@ -285,7 +569,39 @@ def _review_and_apply(
         else:
             console.print(f"[yellow]SKIPPED[/yellow] {escape(path.name)}")
 
-    return written
+    if not pending_ops:
+        return []
+
+    # Apply all approved edits atomically with rollback on first failure.
+    backups: dict[Path, str | None] = {}
+    written: list[Path] = []
+    try:
+        for path, _, _ in pending_ops:
+            backups[path] = path.read_text(encoding="utf-8") if path.exists() else None
+        for path, new_content, operation in pending_ops:
+            if operation == "delete":
+                if path.exists():
+                    path.unlink()
+                written.append(path)
+                continue
+            payload = new_content or ""
+            ok, message = validate_by_extension(path, payload)
+            if not ok:
+                raise RuntimeError(f"{path}: {message}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, encoding="utf-8")
+            written.append(path)
+        return written
+    except Exception as exc:
+        for path, old in backups.items():
+            if old is None:
+                if path.exists():
+                    path.unlink()
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(old, encoding="utf-8")
+        console.print(f"[red]Patch transaction failed; rolled back all writes: {escape(str(exc))}[/red]")
+        return []
 
 
 # ── routing helpers ────────────────────────────────────────────────────────────
@@ -1120,11 +1436,25 @@ def _handle_delete_command(console: Console, raw_paths: list[str]) -> None:
 
 
 def _detect_delete_intent(user_input: str, ref_paths: set[Path]) -> bool:
-    """Return True if the user wants to DELETE the referenced files."""
+    """
+    Return True only for explicit delete-only intent.
+
+    Mixed instructions (e.g. "convert X and delete Y") should not short-circuit
+    into immediate deletion before creation/update actions.
+    """
     if not ref_paths:
         return False
     text = user_input.strip().lower()
-    return any(word in text for word in _DELETE_WORDS)
+    if not any(word in text for word in _DELETE_WORDS):
+        return False
+    if any(v in text for v in _NON_DELETE_ACTION_VERBS):
+        return False
+    starts_with_delete = (
+        text.startswith("delete ")
+        or text.startswith("remove ")
+        or text.startswith("rm ")
+    )
+    return starts_with_delete or text in {"delete", "remove", "rm"}
 
 
 def _mode_prefixed_prompt(agent_mode: str, prompt: str) -> str:
@@ -1282,8 +1612,7 @@ def _handle_freeform(
         if strict_patch_mode:
             prompt += (
                 "\n\nSTRICT PATCH MODE:\n"
-                "You MUST include a unified diff block with headers (---, +++, @@).\n"
-                "Also include complete updated files as fenced code blocks for apply flow.\n"
+                "You MUST output exactly one ```json fenced patch payload using the required edits schema.\n"
                 "Reject free-form prose."
             )
         try:
@@ -1296,11 +1625,11 @@ def _handle_freeform(
             _print_error(console, exc)
             return
         if strict_patch_mode:
-            has_unified_diff = ("--- " in output and "+++ " in output and "@@" in output)
-            if not has_unified_diff:
+            has_json_patch = bool(_JSON_BLOCK_RE.search(output))
+            if not has_json_patch:
                 console.print(
                     "[red]Strict patch mode rejected response:[/red] "
-                    "missing unified diff markers (---, +++, @@)."
+                    "missing JSON patch payload block."
                 )
                 return
         _print_output(console, output)
@@ -1363,18 +1692,23 @@ def _handle_freeform(
 
 
 def _build_patch_hint(ref_paths: set[Path]) -> str:
-    """Return an appended instruction that tells the LLM to emit patchable code blocks."""
+    """Return strict patch protocol instructions."""
     names = ", ".join(p.name for p in ref_paths)
     return (
         f"\n\n---\nIMPORTANT — OUTPUT FORMAT:\n"
-        f"For every file you modify ({names}), output the COMPLETE updated file content "
-        f"inside a fenced code block where the VERY FIRST LINE of the block is a comment "
-        f"with the filename, like this:\n"
-        f"```python\n"
-        f"# ema.py\n"
-        f"<complete new file content here>\n"
+        f"For every file you modify ({names}), output exactly one JSON fenced block "
+        f"with this schema:\n"
+        f"```json\n"
+        f'{{"edits":[{{"path":"relative/path.ext","operation":"write","content":"<complete updated file>"}},'
+        f'{{"path":"relative/path.ext","operation":"delete"}}]}}\n'
         f"```\n"
-        f"Do not truncate. Output the entire file, not just the changed section."
+        f"Rules:\n"
+        f"- operation must be write or delete.\n"
+        f"- write requires content with COMPLETE updated file, not partial snippets.\n"
+        f"- delete must omit content or set content to null.\n"
+        f"- path must point only to attached files when files are attached.\n"
+        f"- for mixed create+delete requests, include both edits in one payload.\n"
+        f"- no prose outside the JSON block."
     )
 
 
@@ -1475,7 +1809,11 @@ def _apply_and_report(
     Extract patches from the LLM response, show a diff for each, ask for
     approval, and only then write the approved files.
     """
-    patches = _extract_patches(output, console, workdir, ref_paths)
+    patches = _extract_json_protocol_patches(output, console, workdir, ref_paths)
+    if patches is None:
+        return
+    if not patches:
+        patches = _extract_patches(output, console, workdir, ref_paths)
     if not patches:
         if ref_paths:
             console.print(

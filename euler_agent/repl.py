@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import sys
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,20 @@ from euler_agent.config.context import (
     list_knowledge_files,
     save_file_role_mapping,
 )
+from euler_agent.session import (
+    SessionHandle,
+    SessionSummary,
+    build_resume_context_prefix,
+    create_session,
+    default_new_session_name,
+    find_session_by_name_or_id,
+    format_turns_recap,
+    git_diff_from_head,
+    git_diff_stats,
+    load_session_handle,
+    load_turns,
+    list_sessions,
+)
 
 # ── prompt_toolkit (optional — graceful fallback to plain input) ──────────────
 try:
@@ -101,6 +116,337 @@ _AGENT_MODES: tuple[str, ...] = tuple(spec.name for spec in MODE_SPECS)
 _SPECIALIST_MODES: frozenset[str] = frozenset(
     spec.name for spec in MODE_SPECS if spec.specialist_role is not None
 )
+
+
+# ── session checkpoint helpers ─────────────────────────────────────────────────
+
+def _session_record_user(ui_state: dict[str, Any], text: str) -> None:
+    h = ui_state.get("session_handle")
+    if isinstance(h, SessionHandle) and text.strip():
+        h.append_turn("user", text)
+
+
+def _session_record_assistant(ui_state: dict[str, Any], text: str) -> None:
+    h = ui_state.get("session_handle")
+    if isinstance(h, SessionHandle) and text.strip():
+        h.append_turn("assistant", text)
+
+
+def _finalize_repl_session(console: Console, ui_state: dict[str, Any]) -> None:
+    if ui_state.get("_session_finalized"):
+        return
+    ui_state["_session_finalized"] = True
+    h = ui_state.get("session_handle")
+    if not isinstance(h, SessionHandle):
+        return
+    wd = Path.cwd().resolve()
+    head_start = h.meta.git_head_start
+    stats = git_diff_stats(wd, head_start)
+    diff_body = git_diff_from_head(wd, head_start)
+    summary = (
+        f"[dim]Checkpoint dir:[/dim] {escape(str(h.root))}\n"
+        f"[dim]Git snapshot at session start:[/dim] {escape(head_start or '(none)')}\n\n"
+        f"[bold]git diff --stat[/bold]\n{escape(stats)}"
+    )
+    try:
+        console.print(
+            Panel(
+                summary,
+                title=f"Session end — {escape(h.name)}",
+                border_style="cyan",
+            )
+        )
+        if diff_body.strip():
+            if diff_body.startswith("(no git") or diff_body.startswith("(could not"):
+                console.print(Panel(escape(diff_body), title="Diff", border_style="yellow"))
+            else:
+                capped = diff_body[:190_000]
+                console.print(
+                    Panel(
+                        Syntax(capped, "diff", theme="monokai", line_numbers=False),
+                        title="git diff vs session start (truncated if huge)",
+                        border_style="green",
+                    )
+                )
+    except Exception:
+        console.print(f"[dim]{escape(diff_body[:8000])}[/dim]")
+
+
+def _try_resume_session(
+    console: Console,
+    ui_state: dict[str, Any],
+    resume_token: str,
+) -> None:
+    cwd = Path.cwd().resolve()
+    sdir = find_session_by_name_or_id(cwd, resume_token)
+    if sdir is None:
+        console.print(
+            f"[red]No session matching[/red] [bold]{escape(resume_token)}[/bold] "
+            f"under this project ([dim].euler/sessions[/dim]). "
+            "Try [bold]/session list[/bold]."
+        )
+        return
+    handle = load_session_handle(sdir)
+    if handle is None:
+        console.print("[red]Invalid session folder (missing meta or turns).[/red]")
+        return
+    if Path(handle.meta.workdir).resolve() != cwd:
+        console.print(
+            "[red]Session belongs to a different directory:[/red]\n"
+            f"  session: {escape(handle.meta.workdir)}\n"
+            f"  cwd:     {escape(str(cwd))}\n"
+            "[dim]cd to the project root and retry.[/dim]"
+        )
+        return
+    ui_state["session_handle"] = handle
+    turns = load_turns(sdir)
+    recap = format_turns_recap(turns, max_lines=24)
+    ui_state["resume_context_prefix"] = build_resume_context_prefix(turns)
+    console.print(
+        Panel(
+            escape(recap) if len(recap) < 120_000 else escape(recap[:119_000] + "\n…"),
+            title=f"Resumed session — {escape(handle.name)}",
+            border_style="magenta",
+        )
+    )
+    if ui_state.get("resume_context_prefix"):
+        console.print(
+            "[dim]The next coding prompt will include a short recap prefix for the model.[/dim]"
+        )
+
+
+def _session_startup_attach(console: Console, ui_state: dict[str, Any], cwd: Path) -> None:
+    """
+    Each Euler launch: default to a new checkpoint session, or let the user resume
+    from a numbered list of past sessions in this project.
+    """
+    cwd = cwd.resolve()
+    if not sys.stdin.isatty():
+        try:
+            h = create_session(cwd, default_new_session_name())
+        except OSError as exc:
+            console.print(f"[red]Could not create session: {escape(str(exc))}[/red]")
+            return
+        ui_state["session_handle"] = h
+        ui_state["resume_context_prefix"] = ""
+        console.print(
+            f"[dim]Non-interactive stdin — new session:[/dim] "
+            f"[bold]{escape(h.name)}[/bold]"
+        )
+        return
+
+    rows = list_sessions(cwd)
+    if not rows:
+        try:
+            h = create_session(cwd, default_new_session_name())
+        except OSError as exc:
+            console.print(f"[red]Could not create session: {escape(str(exc))}[/red]")
+            return
+        ui_state["session_handle"] = h
+        ui_state["resume_context_prefix"] = ""
+        console.print(
+            f"[dim]Session started:[/dim] [bold]{escape(h.name)}[/bold]  "
+            f"[dim]({escape(h.session_id)})[/dim]"
+        )
+        return
+
+    max_show = 30
+    shown: list[SessionSummary] = rows[:max_show]
+    console.print(
+        "[bold cyan]Session[/bold cyan] — "
+        "[white]1[/white] = new (default), or pick a past chat to resume:"
+    )
+    console.print("  [bold]1[/bold]  New session  [dim](fresh checkpoint)[/dim]")
+    for i, r in enumerate(shown, start=2):
+        console.print(
+            f"  [bold]{i}[/bold]  [cyan]{escape(r.name)}[/cyan]  "
+            f"[dim]turns={r.turn_count}  id={escape(r.session_id)}[/dim]"
+        )
+    if len(rows) > max_show:
+        console.print(
+            f"  [dim]… {len(rows) - max_show} more — run Euler session list[/dim]"
+        )
+    try:
+        raw = console.input("Choice [1]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+    if not raw or raw == "1":
+        try:
+            h = create_session(cwd, default_new_session_name())
+        except OSError as exc:
+            console.print(f"[red]Could not create session: {escape(str(exc))}[/red]")
+            return
+        ui_state["session_handle"] = h
+        ui_state["resume_context_prefix"] = ""
+        console.print(f"[green]New session:[/green] [bold]{escape(h.name)}[/bold]")
+        return
+
+    if raw.isdigit():
+        choice = int(raw)
+        if 2 <= choice <= len(shown) + 1:
+            picked = shown[choice - 2]
+            _try_resume_session(console, ui_state, picked.session_id)
+            if isinstance(ui_state.get("session_handle"), SessionHandle):
+                return
+            console.print("[yellow]Resume failed — starting a new session.[/yellow]")
+            try:
+                h = create_session(cwd, default_new_session_name())
+            except OSError as exc:
+                console.print(f"[red]Could not create session: {escape(str(exc))}[/red]")
+                return
+            ui_state["session_handle"] = h
+            ui_state["resume_context_prefix"] = ""
+            console.print(f"[green]New session:[/green] [bold]{escape(h.name)}[/bold]")
+            return
+
+    console.print("[yellow]Unrecognized choice — starting a new session.[/yellow]")
+    try:
+        h = create_session(cwd, default_new_session_name())
+    except OSError as exc:
+        console.print(f"[red]Could not create session: {escape(str(exc))}[/red]")
+        return
+    ui_state["session_handle"] = h
+    ui_state["resume_context_prefix"] = ""
+    console.print(f"[green]New session:[/green] [bold]{escape(h.name)}[/bold]")
+
+
+def _handle_session_command(
+    console: Console,
+    payload: str,
+    ui_state: dict[str, Any],
+) -> None:
+    raw = payload.strip()
+    if not raw:
+        console.print(
+            "[bold]/session[/bold] commands:\n"
+            "  (Each [bold]Euler[/bold] start offers a new session or resume list.)\n"
+            "  /session new <name>     — switch to a new named checkpoint\n"
+            "  /session open <name|id> — attach to an existing session\n"
+            "  /session list           — sessions for this project\n"
+            "  /session show           — active session\n"
+            "  /session peek [n]       — last n transcript turns (default 15)\n"
+            "  /session save           — ensure checkpoint on disk (usually automatic)\n"
+            "  /session close          — detach without exiting REPL\n"
+            "  /exit                   — leave REPL (shows git diff summary if in session)\n"
+            "\n[dim]CLI: Euler --resume <id> skips the menu  |  Euler session list[/dim]"
+        )
+        return
+    head, _, tail = raw.partition(" ")
+    sub = head.lower().strip()
+    rest = tail.strip()
+    cwd = Path.cwd().resolve()
+
+    if sub in {"help", "-h", "--help"}:
+        _handle_session_command(console, "", ui_state)
+        return
+
+    if sub == "list":
+        rows = list_sessions(cwd)
+        if not rows:
+            console.print("[yellow]No sessions yet. Use /session new <name>.[/yellow]")
+            return
+        for r in rows:
+            active = (
+                isinstance(ui_state.get("session_handle"), SessionHandle)
+                and ui_state["session_handle"].session_id == r.session_id
+            )
+            mark = " *" if active else ""
+            console.print(
+                f"  [bold]{escape(r.name)}[/bold]{mark}  "
+                f"[dim]{escape(r.session_id)}  turns={r.turn_count}  "
+                f"updated {escape(r.updated_at)}[/dim]"
+            )
+        return
+
+    if sub == "show":
+        h = ui_state.get("session_handle")
+        if not isinstance(h, SessionHandle):
+            console.print("[yellow]No active session. /session new <name> or /session open …[/yellow]")
+            return
+        console.print(
+            f"[cyan]Active:[/cyan] [bold]{escape(h.name)}[/bold] ({escape(h.session_id)})\n"
+            f"[dim]{escape(str(h.root))}[/dim]"
+        )
+        return
+
+    if sub == "peek":
+        h = ui_state.get("session_handle")
+        if not isinstance(h, SessionHandle):
+            console.print("[yellow]No active session.[/yellow]")
+            return
+        n = 15
+        if rest.isdigit():
+            n = max(1, min(200, int(rest)))
+        turns = load_turns(h.root, tail=n * 2)
+        recap = format_turns_recap(turns, max_lines=n * 2)
+        console.print(Panel(escape(recap), title=f"Last turns ({n})", border_style="blue"))
+        return
+
+    if sub == "save":
+        h = ui_state.get("session_handle")
+        if not isinstance(h, SessionHandle):
+            console.print("[yellow]No active session.[/yellow]")
+            return
+        h.touch()
+        console.print("[green]Checkpoint metadata refreshed on disk.[/green]")
+        return
+
+    if sub == "close":
+        ui_state["session_handle"] = None
+        ui_state["resume_context_prefix"] = ""
+        console.print("[yellow]Detached from session (checkpoint files kept under .euler/sessions).[/yellow]")
+        return
+
+    if sub == "new":
+        name = rest.strip()
+        if not name:
+            console.print("[red]usage: /session new <name>[/red]")
+            return
+        try:
+            h = create_session(cwd, name)
+        except OSError as exc:
+            console.print(f"[red]Could not create session: {escape(str(exc))}[/red]")
+            return
+        ui_state["session_handle"] = h
+        ui_state["resume_context_prefix"] = ""
+        console.print(
+            f"[green]Session started:[/green] [bold]{escape(h.name)}[/bold] "
+            f"[dim]({escape(h.session_id)})[/dim]"
+        )
+        return
+
+    if sub == "open":
+        token = rest.strip()
+        if not token:
+            console.print("[red]usage: /session open <name|session_id>[/red]")
+            return
+        sdir = find_session_by_name_or_id(cwd, token)
+        if sdir is None:
+            console.print(f"[red]No session matching {escape(token)}[/red]")
+            return
+        handle = load_session_handle(sdir)
+        if handle is None:
+            console.print("[red]Invalid session data.[/red]")
+            return
+        if Path(handle.meta.workdir).resolve() != cwd:
+            console.print(
+                "[red]That session belongs to another directory; cannot attach.[/red]"
+            )
+            return
+        ui_state["session_handle"] = handle
+        ui_state["resume_context_prefix"] = build_resume_context_prefix(load_turns(sdir))
+        console.print(
+            f"[green]Attached:[/green] [bold]{escape(handle.name)}[/bold] "
+            f"[dim]({escape(handle.session_id)})[/dim]"
+        )
+        if ui_state.get("resume_context_prefix"):
+            console.print(
+                "[dim]Next coding prompt includes a short recap prefix for the model.[/dim]"
+            )
+        return
+
+    console.print(f"[red]Unknown /session subcommand:[/red] {escape(sub)}. Try /session")
 
 
 # ── patch extraction & approval ────────────────────────────────────────────────
@@ -276,6 +622,15 @@ if _PT_AVAILABLE:
                     "/delete",
                     "/exit",
                     "/quit",
+                    "/session",
+                    "/session help",
+                    "/session new",
+                    "/session open",
+                    "/session list",
+                    "/session show",
+                    "/session peek",
+                    "/session save",
+                    "/session close",
                 ]
                 mode_commands = [f"/agent set {mode}" for mode in _AGENT_MODES]
                 all_commands = sorted(set(base_commands + mode_commands))
@@ -362,7 +717,7 @@ if _PT_AVAILABLE:
 
 # ── REPL entry point ──────────────────────────────────────────────────────────
 
-def run_repl(agent: EulerAgent) -> None:
+def run_repl(agent: EulerAgent, *, resume: str | None = None) -> None:
     console = Console()
     mode_state: dict[str, Any] = {
         "agent_mode": "basic",
@@ -372,12 +727,22 @@ def run_repl(agent: EulerAgent) -> None:
         "cache_hits": 0,
         "last_metrics": {},
         "last_metrics_seq": 0,
+        "session_handle": None,
+        "resume_context_prefix": "",
+        "_session_finalized": False,
     }
     console.print(
         "[bold cyan]Euler REPL[/bold cyan] — type [bold]/help[/bold] for commands, "
         "[bold]@[/bold] to reference files/folders "
         "[dim](agent mode: basic)[/dim]"
     )
+    cwd = Path.cwd().resolve()
+    if resume and resume.strip():
+        _try_resume_session(console, mode_state, resume.strip())
+        if not isinstance(mode_state.get("session_handle"), SessionHandle):
+            _session_startup_attach(console, mode_state, cwd)
+    else:
+        _session_startup_attach(console, mode_state, cwd)
 
     session = _make_session() if _PT_AVAILABLE else None
 
@@ -389,6 +754,7 @@ def run_repl(agent: EulerAgent) -> None:
             else:
                 user_input = console.input("[bold green]euler> [/bold green]").strip()
         except (EOFError, KeyboardInterrupt):
+            _finalize_repl_session(console, mode_state)
             console.print("\n[yellow]bye[/yellow]")
             break
 
@@ -400,9 +766,11 @@ def run_repl(agent: EulerAgent) -> None:
             if pending_refs and not user_input.startswith("/"):
                 user_input = " ".join(pending_refs) + " " + user_input
                 mode_state["pending_refs"] = []
+            _session_record_user(mode_state, user_input)
             _handle_input(console, agent, user_input, mode_state)
             _record_agent_metrics(agent, mode_state)
         except (EOFError, KeyboardInterrupt):
+            _finalize_repl_session(console, mode_state)
             console.print("\n[yellow]bye[/yellow]")
             break
         except Exception as exc:
@@ -415,12 +783,17 @@ def _handle_input(
     console: Console,
     agent: EulerAgent,
     user_input: str,
-    mode_state: dict[str, str],
+    mode_state: dict[str, Any],
 ) -> None:
     cmd = parse_slash_command(user_input)
 
+    if cmd and cmd.name == "/session":
+        payload = user_input.strip()[len("/session") :].strip()
+        _handle_session_command(console, payload, mode_state)
+        return
+
     if user_input in {"/exit", "/quit"}:
-        console.print("[yellow]bye[/yellow]")
+        _finalize_repl_session(console, mode_state)
         raise KeyboardInterrupt
 
     if user_input == "/help":
@@ -449,7 +822,8 @@ def _handle_input(
             "  @folder/                         — attach all code files in a folder\n"
             "  https://example.com/page         — auto-attach webpage context\n"
             "  /delete @file1 @file2 ...        — delete files (with confirmation)\n"
-            "  /exit | /quit                    — exit REPL\n\n"
+            "  /session …                       — named checkpoints (try /session)\n"
+            "  /exit | /quit                    — exit REPL (git diff summary if in session)\n\n"
             "[dim]Agent mode examples:\n"
             "  /agent set basic      (default routing)\n"
             "  /agent set swarm      (always multi-agent pipeline)\n"
@@ -525,6 +899,7 @@ def _handle_input(
             with console.status("[bold cyan]Generating SQL...[/bold cyan]", spinner="dots"):
                 result = agent.generate_sql(requirement)
             _safe_print(console, result)
+            _session_record_assistant(mode_state, result)
         except Exception as exc:
             _print_error(console, exc)
         return
@@ -576,6 +951,7 @@ def _handle_input(
                     verify_command=verify if sep else None,
                 )
             _safe_print(console, output)
+            _session_record_assistant(mode_state, output)
         except Exception as exc:
             _print_error(console, exc)
         return
@@ -669,6 +1045,7 @@ def _handle_input(
             with console.status("[bold cyan]Converting...[/bold cyan]", spinner="dots"):
                 result = agent.convert_file(file_path.strip(), target_lang.strip())
             _safe_print(console, result)
+            _session_record_assistant(mode_state, result)
         except Exception as exc:
             _print_error(console, exc)
         return
@@ -699,6 +1076,7 @@ def _handle_input(
             with console.status("[bold cyan]Converting...[/bold cyan]", spinner="dots"):
                 result = agent.convert_language(source_code, src_lang, tgt_lang)
             _safe_print(console, result)
+            _session_record_assistant(mode_state, result)
         except Exception as exc:
             _print_error(console, exc)
         return
@@ -912,6 +1290,10 @@ def _handle_freeform(
 ) -> None:
     """Route free-form prompts, inject file content, call agent, apply patches."""
     expanded_input, notes, ref_paths = _expand_file_references(user_input)
+    if ui_state is not None:
+        rp = ui_state.pop("resume_context_prefix", "")
+        if isinstance(rp, str) and rp.strip():
+            expanded_input = rp + expanded_input
     expanded_input, web_notes = _expand_web_references(expanded_input)
     notes.extend(web_notes)
     for note in notes:
@@ -939,7 +1321,7 @@ def _handle_freeform(
         except Exception as exc:
             _print_error(console, exc)
             return
-        _print_output(console, output)
+        _print_output(console, output, ui_state)
         return
 
     # ── forced mode: specialist role single-call ──────────────────────────────
@@ -957,7 +1339,7 @@ def _handle_freeform(
         except Exception as exc:
             _print_error(console, exc)
             return
-        _print_output(console, output)
+        _print_output(console, output, ui_state)
         _apply_and_report(console, output, workdir, ref_paths if has_file_refs else set())
         return
 
@@ -987,7 +1369,7 @@ def _handle_freeform(
                     "missing JSON patch payload block."
                 )
                 return
-        _print_output(console, output)
+        _print_output(console, output, ui_state)
         _apply_and_report(console, output, workdir, ref_paths if has_file_refs else set())
         return
 
@@ -1001,7 +1383,7 @@ def _handle_freeform(
         except Exception as exc:
             _print_error(console, exc)
             return
-        _print_output(console, output)
+        _print_output(console, output, ui_state)
         _apply_and_report(console, output, workdir, set())
         return
 
@@ -1014,7 +1396,7 @@ def _handle_freeform(
         except Exception as exc:
             _print_error(console, exc)
             return
-        _print_output(console, output)
+        _print_output(console, output, ui_state)
         return
 
     # ── path B: action + @file refs — fast call with explicit patch format ────
@@ -1029,7 +1411,7 @@ def _handle_freeform(
         except Exception as exc:
             _print_error(console, exc)
             return
-        _print_output(console, output)
+        _print_output(console, output, ui_state)
         _apply_and_report(console, output, workdir, ref_paths)
         return
 
@@ -1042,7 +1424,7 @@ def _handle_freeform(
     except Exception as exc:
         _print_error(console, exc)
         return
-    _print_output(console, output)
+    _print_output(console, output, ui_state)
     _apply_and_report(console, output, workdir, set())
 
 
@@ -1135,7 +1517,11 @@ def _fuzzy_file_pick(console: Console, root: Path, query: str, ui_state: dict[st
     )
 
 
-def _print_output(console: Console, output: str) -> None:
+def _print_output(
+    console: Console,
+    output: str,
+    ui_state: dict[str, Any] | None = None,
+) -> None:
     if not output or not str(output).strip():
         console.print(
             Panel(
@@ -1152,6 +1538,8 @@ def _print_output(console: Console, output: str) -> None:
         )
         return
     _safe_print(console, output)
+    if ui_state is not None:
+        _session_record_assistant(ui_state, str(output))
 
 
 def _apply_and_report(

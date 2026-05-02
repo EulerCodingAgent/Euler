@@ -24,6 +24,7 @@ from euler_agent.config.settings import AgentConfig, Provider, load_config, save
 from euler_agent.memory.store import search_memory
 from euler_agent.analysis.semantic_index import index_path, search_index
 from euler_agent.repl import run_repl
+from euler_agent.session import list_sessions
 
 app = typer.Typer(help="Euler coding agent CLI")
 console = Console()
@@ -235,7 +236,15 @@ def _interactive_startup_config(cfg: AgentConfig) -> AgentConfig:
 
 
 @app.callback(invoke_without_command=True)
-def main(ctx: typer.Context) -> None:
+def main(
+    ctx: typer.Context,
+    resume: Optional[str] = typer.Option(
+        None,
+        "--resume",
+        "-r",
+        help="Resume this session id/name directly (skips the new/resume menu)",
+    ),
+) -> None:
     """
     Start interactive Euler REPL if no command is given.
     """
@@ -250,7 +259,33 @@ def main(ctx: typer.Context) -> None:
         )
         agent = _build_agent(cfg)
         _probe_connection(agent)
-        run_repl(agent)
+        run_repl(agent, resume=resume)
+
+
+session_app = typer.Typer(help="List or inspect named REPL session checkpoints")
+app.add_typer(session_app, name="session")
+
+
+@session_app.command("list")
+def session_list(
+    workdir: Optional[Path] = typer.Option(
+        None,
+        "--workdir",
+        "-w",
+        help="Project root (defaults to current directory)",
+    ),
+) -> None:
+    """Print named sessions stored under <project>/.euler/sessions/."""
+    root = (workdir or Path.cwd()).resolve()
+    rows = list_sessions(root)
+    if not rows:
+        console.print(f"[yellow]No sessions in[/yellow] {root}")
+        return
+    for r in rows:
+        console.print(
+            f"[bold]{r.name}[/bold]  [dim]{r.session_id}[/dim]  "
+            f"turns={r.turn_count}  updated={r.updated_at}"
+        )
 
 
 config_app = typer.Typer(help="Manage provider/model/API key configuration")

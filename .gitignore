@@ -16,3 +16,6 @@ Euler_Agent.egg-info
 
 test
 Euler-Knowledge/
+
+# Local REPL session checkpoints (see /session, Euler --resume)
+.euler/sessions/
